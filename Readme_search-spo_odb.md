@@ -29,7 +29,7 @@ Screenshot Example:
 ![image](https://github.com/user-attachments/assets/afc3eeaf-56ed-4afb-93e0-e31feb989bbb)
 
 
-**!Important Notes**
+**Important Notes!!**
 
 •	The searchRegion must match your Tenant regions.
 •	Performing a search with application permission is limited to one geographic region. You must specify a value for the region property in your search request when you use application permissions to run a search. To get the region value for a tenant, use the dataLocationCode property of the siteCollection resource
