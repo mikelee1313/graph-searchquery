@@ -13,7 +13,7 @@ The actual search query is embedded into the **$requestPayload** parameter:
 ![image](https://github.com/user-attachments/assets/32748983-e0b1-493f-9b59-67ee7206839e)
 
 
-This will look at a file in c:\temp\userlist.txt by default.
+The  "$searchQuery" will look at a file in c:\temp\userlist.txt by default to locate the actual query to issue.
 
 Example of query for a OneDrive site:
 
