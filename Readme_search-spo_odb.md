@@ -22,6 +22,13 @@ Example of query for a OneDrive site:
 ![image](https://github.com/user-attachments/assets/afc3eeaf-56ed-4afb-93e0-e31feb989bbb)
 
 
+Important! 
+
+The searchRegion must match your Tenant regions.
+
+_Performing a search with application permission is limited to one geographic region. You must specify a value for the region property in your search request when you use application permissions to run a search. To get the region value for a tenant, use the dataLocationCode property of the siteCollection resource. For more information and examples, see Get the region value._
+
+
 After running the script, the output will create a CSV file in the user local temp folder %temp%.
 
 ![image](https://github.com/user-attachments/assets/7a383b28-3beb-459f-b3d2-ee822b819501)
@@ -41,3 +48,7 @@ https://learn.microsoft.com/en-us/graph/api/resources/search-api-overview?view=g
 searchEntity: query
 
 https://learn.microsoft.com/en-us/graph/api/search-query?view=graph-rest-1.0&tabs=http
+
+Search SharePoint content with application permissions
+
+https://learn.microsoft.com/en-us/graph/search-concept-searchall
