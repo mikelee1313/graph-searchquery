@@ -22,6 +22,11 @@ Example of query for a OneDrive site:
 ![image](https://github.com/user-attachments/assets/afc3eeaf-56ed-4afb-93e0-e31feb989bbb)
 
 
+After running the script, the output will create a CSV file in the user local temp folder %temp%.
+
+![image](https://github.com/user-attachments/assets/7a383b28-3beb-459f-b3d2-ee822b819501)
+
+
 Example Output:
 
 ![image](https://github.com/user-attachments/assets/e071d9ef-cd77-4476-9921-1d9f2d571ee2)
