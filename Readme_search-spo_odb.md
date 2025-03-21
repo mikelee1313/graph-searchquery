@@ -24,7 +24,7 @@ Text Example:
 
 "(Contoso Purchasing Data - Q11.xlsx) (path:\"https://m365x49978400-my.sharepoint.com/personal/admin_m365x49978400_onmicrosoft_com\")"
 
-Screenshot Example
+Screenshot Example:
 
 ![image](https://github.com/user-attachments/assets/afc3eeaf-56ed-4afb-93e0-e31feb989bbb)
 
