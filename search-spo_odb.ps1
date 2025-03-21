@@ -39,7 +39,7 @@ foreach ($searchQuery in $searchQueryList ) {
 }
 
 .NOTES
-Authors: Mike Lee
+Authors: Mike Lee, Chanchal Jain
 Date: 3/21/2025
 
 Disclaimer: The sample scripts are provided AS IS without warranty of any kind. 
