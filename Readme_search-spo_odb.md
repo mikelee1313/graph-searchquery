@@ -26,7 +26,7 @@ Important!
 
 The searchRegion must match your Tenant regions.
 
-_Performing a search with application permission is limited to one geographic region. You must specify a value for the region property in your search request when you use application permissions to run a search. To get the region value for a tenant, use the dataLocationCode property of the siteCollection resource. For more information and examples, see Get the region value._
+_Performing a search with application permission is limited to one geographic region. You must specify a value for the region property in your search request when you use application permissions to run a search. To get the region value for a tenant, use the dataLocationCode property of the siteCollection resource._
 
 
 After running the script, the output will create a CSV file in the user local temp folder %temp%.
