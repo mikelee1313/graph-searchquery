@@ -22,7 +22,7 @@ Example of query for a OneDrive site:
 ![image](https://github.com/user-attachments/assets/afc3eeaf-56ed-4afb-93e0-e31feb989bbb)
 
 
-Important! 
+**!Important! **
 
 The searchRegion must match your Tenant regions.
 
