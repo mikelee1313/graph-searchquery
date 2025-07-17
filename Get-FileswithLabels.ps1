@@ -75,9 +75,6 @@ $date = Get-Date -Format "yyyyMMddHHmmss";
 # The log file will store the search results including sensitivity labels in CSV format
 $LogName = Join-Path -Path $env:TEMP -ChildPath ("OneDrive_Search_Results_" + $date + ".csv");
 
-# This specifies the region for the search query
-$searchRegion = "NAM";
-
 # Initialize global variables for the token and search results
 $global:token = @();
 $global:Results = @();
