@@ -23,9 +23,6 @@ Prerequisites   :
 PS> .\Get-FileswithLabels.ps1
 Performs the search and exports results to a CSV file in the %TEMP% directory.
 
-.INPUTS
-None. You cannot pipe objects to this script.
-
 .OUTPUTS
 CSV file with search results including file details and sensitivity labels.
 
