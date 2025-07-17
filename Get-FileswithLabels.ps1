@@ -59,6 +59,9 @@ $tenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3';
 $clientId = 'abc64618-283f-47ba-a185-50d935d51d57';
 $clientSecret = '';
 
+# This specifies the region for the search query
+$searchRegion = "NAM";
+
 # ======================================
 # CONFIGURATION SECTION - ADMIN SETTINGS
 # ======================================
