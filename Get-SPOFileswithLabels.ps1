@@ -95,7 +95,7 @@ Add-Type -AssemblyName System.Web
 $date = Get-Date -Format "yyyyMMddHHmmss";
 
 # The log file will store the search results including sensitivity labels in CSV format
-$LogName = Join-Path -Path $env:TEMP -ChildPath ("OneDrive_Search_Results_" + $date + ".csv");
+$LogName = Join-Path -Path $env:TEMP -ChildPath ("SPOFileswithLabels_Search_Results_" + $date + ".csv");
 
 # Initialize global variables for the token and search results
 $global:token = @();
