@@ -12,7 +12,7 @@ This repository contains PowerShell scripts for querying and reporting on ShareP
   - [TenantWide_SP_Copilot_Agents_Insights.ps1](#tenantwide_sp_copilot_agents_insightsps1)
   - [search-spo_odb.ps1](#search-spo_odbps1)
   - [search_and_download.ps1](#search_and_downloadps1)
-  - [Get-SPOFileswithLabels.ps1](#GetSPOFileswithLabelsps1)
+  - [Get-SPOFileswithLabels.ps1](#get-spofileswithlabelsps1)
 - [Disclaimer](#disclaimer)
 - [Authors](#authors)
 
