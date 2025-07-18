@@ -420,7 +420,34 @@ function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId 
             Write-Host "  Parsed - Site: $siteType, User: $userPart, File: $filePath" -ForegroundColor Gray
             
             # Convert user part to proper email format for user API
-            $userEmail = $userPart -replace '_', '@' -replace '@onmicrosoft@com', '.onmicrosoft.com'
+            # Handle both onmicrosoft.com and vanity domains
+            # Examples:
+            # - "Will_Bob_m365cpi13246019_onmicrosoft_com" -> "Will.Bob@m365cpi13246019.onmicrosoft.com"
+            # - "Will_Bob_contoso_com" -> "Will.Bob@contoso.com"
+            
+            if ($userPart -match '_onmicrosoft_com$') {
+                # Handle onmicrosoft.com domains
+                $userEmail = $userPart -replace '_onmicrosoft_com$', '.onmicrosoft.com'  # Fix the domain suffix first
+                $userEmail = $userEmail -replace '_([^_]+)\.onmicrosoft\.com$', '@$1.onmicrosoft.com'  # Replace the last underscore before domain with @
+                $userEmail = $userEmail -replace '_', '.'  # Convert remaining underscores to dots (for names like Will_Bob -> Will.Bob)
+            }
+            elseif ($userPart -match '_([^_]+)_com$') {
+                # Handle vanity domains like contoso.com
+                $userEmail = $userPart -replace '_com$', '.com'  # Fix the domain suffix first
+                $userEmail = $userEmail -replace '_([^_]+)\.com$', '@$1.com'  # Replace the last underscore before domain with @
+                $userEmail = $userEmail -replace '_', '.'  # Convert remaining underscores to dots
+            }
+            elseif ($userPart -match '_([^_]+)_([^_]+)$') {
+                # Handle other TLDs like .org, .net, etc.
+                # Pattern: user_domain_tld -> user@domain.tld
+                $userEmail = $userPart -replace '_([^_]+)_([^_]+)$', '@$1.$2'  # Replace last two underscores with @domain.tld
+                $userEmail = $userEmail -replace '_', '.'  # Convert remaining underscores to dots
+            }
+            else {
+                # Fallback: treat as simple name_domain pattern
+                $userEmail = $userPart -replace '_', '@' -replace '@@', '@'  # Simple replacement with duplicate @ cleanup
+            }
+            
             if ($debug) {
                 Write-Host "  Converted user email: $userEmail" -ForegroundColor Gray
             }
