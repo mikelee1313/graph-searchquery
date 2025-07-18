@@ -37,13 +37,14 @@ Microsoft Graph API
 - Authenticates with Microsoft Graph API using client credentials
 - Performs search queries for specific files in OneDrive
 - Handles pagination for large result sets
+- Handles throttling using exponential backoff
 - Extracts sensitivity labels and other file metadata
 - Exports results to a CSV file
 #>
 
-# ======================================
-# CONFIGURATION SECTION - ADMIN SETTINGS
-# ======================================
+##############################################################
+#                  CONFIGURATION SECTION                    #
+#############################################################
 # Modify these values according to your environment
 
 # Set your tenant name (the part before .sharepoint.com)
@@ -61,14 +62,25 @@ $debug = $false
 # Set the tenant ID, client ID, and client secret for authentication
 $tenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3';
 $clientId = 'abc64618-283f-47ba-a185-50d935d51d57';
+
+# Authentication type: Choose 'ClientSecret' or 'Certificate'
+$AuthType = 'ClientSecret'  # Valid values: 'ClientSecret' or 'Certificate'
+
+# Client Secret authentication (used when $AuthType = 'ClientSecret')
 $clientSecret = '';
+
+# Certificate authentication (used when $AuthType = 'Certificate')
+$Thumbprint = "B696FDCFE1453F3FBC6031F54DE988DA0ED905A9"
+
+# Certificate store location: Choose 'LocalMachine' or 'CurrentUser'
+$CertStore = 'LocalMachine'  # Valid values: 'LocalMachine' or 'CurrentUser'
 
 # This specifies the region for the search query
 $searchRegion = "NAM";
 
-# ======================================
-# CONFIGURATION SECTION - ADMIN SETTINGS
-# ======================================
+#############################################################
+#                  CONFIGURATION SECTION                    #
+#############################################################
 
 # Load required assemblies
 Add-Type -AssemblyName System.Web
@@ -83,24 +95,199 @@ $LogName = Join-Path -Path $env:TEMP -ChildPath ("OneDrive_Search_Results_" + $d
 $global:token = @();
 $global:Results = @();
 
+# Function to handle throttling for Microsoft Graph requests
+# This implements best practices from https://learn.microsoft.com/en-us/graph/throttling
+# It automatically handles 429 "Too Many Requests" responses with either:
+# 1. The Retry-After header value if provided by the server
+# 2. Exponential backoff if no Retry-After header is present
+function Invoke-GraphRequestWithThrottleHandling {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$Method,
+        
+        [Parameter(Mandatory = $false)]
+        [hashtable]$Headers = @{},
+        
+        [Parameter(Mandatory = $false)]
+        [string]$Body = $null,
+        
+        [Parameter(Mandatory = $false)]
+        [string]$ContentType = "application/json",
+        
+        [Parameter(Mandatory = $false)]
+        [int]$MaxRetries = 10,
+        
+        [Parameter(Mandatory = $false)]
+        [int]$InitialBackoffSeconds = 2
+    )
+    
+    $retryCount = 0
+    $backoffSeconds = $InitialBackoffSeconds
+    $success = $false
+    $result = $null
+    
+    if ($debug) {
+        Write-Host "Making Graph request to $Uri" -ForegroundColor Gray
+    }
+    
+    while (-not $success -and $retryCount -lt $MaxRetries) {
+        try {
+            if ($Body) {
+                $result = Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -Body $Body -ContentType $ContentType -ErrorAction Stop
+            }
+            else {
+                $result = Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -ContentType $ContentType -ErrorAction Stop
+            }
+            $success = $true
+        }
+        catch {
+            $statusCode = $_.Exception.Response.StatusCode.value__
+            
+            # Check if this is a throttling error (429)
+            if ($statusCode -eq 429) {
+                # Get the Retry-After header if it exists
+                $retryAfter = $null
+                if ($_.Exception.Response.Headers.Contains("Retry-After")) {
+                    $retryAfter = [int]($_.Exception.Response.Headers.GetValues("Retry-After") | Select-Object -First 1)
+                    Write-Host "Request throttled. Retry-After header suggests waiting for $retryAfter seconds." -ForegroundColor Yellow
+                }
+                else {
+                    # If no Retry-After header, use exponential backoff
+                    $retryAfter = $backoffSeconds
+                    Write-Host "Request throttled. Using exponential backoff: waiting for $retryAfter seconds." -ForegroundColor Yellow
+                    # Increase backoff for next potential retry (exponential)
+                    $backoffSeconds = $backoffSeconds * 2
+                }
+                
+                $retryCount++
+                if ($retryCount -lt $MaxRetries) {
+                    Write-Host "Throttling detected. Waiting before retry. Attempt $retryCount of $MaxRetries..." -ForegroundColor Yellow
+                    Start-Sleep -Seconds $retryAfter
+                }
+                else {
+                    Write-Host "Maximum retry attempts reached ($MaxRetries). Giving up." -ForegroundColor Red
+                    throw $_
+                }
+            }
+            else {
+                # Not a throttling error, rethrow
+                throw $_
+            }
+        }
+    }
+    
+    return $result
+}
+
 # This function authenticates with Microsoft Graph API and retrieves an access token
 function AcquireToken() {
-    # Define the URI for authentication
-    $uri = "https://login.microsoftonline.com/" + $tenantId + "/oauth2/token";
-
-    # Define the body for the authentication request
-    # Adding scope for Information Protection to access sensitivity labels
-    $body = @{
-        grant_type    = "client_credentials"
-        client_id     = $clientId
-        client_secret = $clientSecret
-        resource      = 'https://graph.microsoft.com'
-        scope         = 'https://graph.microsoft.com/.default'
-    };
-
-    # Send the authentication request and extract the token
-    $loginResponse = Invoke-RestMethod -Method Post -Uri $uri -Body $body -ContentType 'application/x-www-form-urlencoded';
-    $global:token = $loginResponse.access_token;
+    Write-Host "Connecting to Microsoft Graph using $AuthType authentication..." -ForegroundColor Cyan
+    
+    if ($AuthType -eq 'ClientSecret') {
+        # Client Secret authentication
+        $uri = "https://login.microsoftonline.com/" + $tenantId + "/oauth2/token";
+        
+        # Define the body for the authentication request
+        $body = @{
+            grant_type    = "client_credentials"
+            client_id     = $clientId
+            client_secret = $clientSecret
+            resource      = 'https://graph.microsoft.com'
+            scope         = 'https://graph.microsoft.com/.default'
+        };
+        
+        try {
+            # Send the authentication request and extract the token
+            $loginResponse = Invoke-RestMethod -Method Post -Uri $uri -Body $body -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop;
+            $global:token = $loginResponse.access_token;
+            Write-Host "Successfully connected using Client Secret authentication" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "Failed to connect using Client Secret authentication" -ForegroundColor Red
+            Write-Host $_.Exception.Message -ForegroundColor Red
+            Exit
+        }
+    }
+    elseif ($AuthType -eq 'Certificate') {
+        # Certificate authentication
+        $uri = "https://login.microsoftonline.com/" + $tenantId + "/oauth2/v2.0/token";
+        
+        # Get the certificate from the local certificate store
+        try {
+            $cert = Get-Item -Path "Cert:\$CertStore\My\$Thumbprint" -ErrorAction Stop
+        }
+        catch {
+            Write-Host "Certificate with thumbprint $Thumbprint not found in $CertStore\My store" -ForegroundColor Red
+            Write-Host $_.Exception.Message -ForegroundColor Red
+            Exit
+        }
+        
+        # Create the JWT assertion for certificate authentication
+        $now = [System.DateTimeOffset]::UtcNow
+        $exp = $now.AddMinutes(10).ToUnixTimeSeconds()
+        $nbf = $now.ToUnixTimeSeconds()
+        $aud = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
+        
+        # Create JWT header
+        $header = @{
+            alg = "RS256"
+            typ = "JWT"
+            x5t = [Convert]::ToBase64String($cert.GetCertHash()).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+        } | ConvertTo-Json -Compress
+        
+        # Create JWT payload
+        $payload = @{
+            aud = $aud
+            exp = $exp
+            iss = $clientId
+            jti = [System.Guid]::NewGuid().ToString()
+            nbf = $nbf
+            sub = $clientId
+        } | ConvertTo-Json -Compress
+        
+        # Base64 encode header and payload
+        $headerBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($header)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+        $payloadBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+        
+        # Create the string to sign
+        $stringToSign = "$headerBase64.$payloadBase64"
+        
+        # Sign the string with the certificate
+        $signature = $cert.PrivateKey.SignData([System.Text.Encoding]::UTF8.GetBytes($stringToSign), [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $signatureBase64 = [Convert]::ToBase64String($signature).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+        
+        # Create the final JWT
+        $jwt = "$stringToSign.$signatureBase64"
+        
+        # Define the body for the authentication request
+        $body = @{
+            client_id             = $clientId
+            client_assertion_type = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+            client_assertion      = $jwt
+            scope                 = "https://graph.microsoft.com/.default"
+            grant_type            = "client_credentials"
+        }
+        
+        try {
+            # Send the authentication request and extract the token
+            $loginResponse = Invoke-RestMethod -Method Post -Uri $uri -Body $body -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop;
+            $global:token = $loginResponse.access_token;
+            Write-Host "Successfully connected using Certificate authentication" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "Failed to connect using Certificate authentication" -ForegroundColor Red
+            Write-Host $_.Exception.Message -ForegroundColor Red
+            Exit
+        }
+    }
+    else {
+        Write-Host "Invalid authentication type: $AuthType. Valid values are 'ClientSecret' or 'Certificate'." -ForegroundColor Red
+        Exit
+    }
 }
 
 
@@ -157,7 +344,7 @@ function PerformSearch {
         }
 "@;
         # Invoke the REST method to perform the search query
-        $Results = Invoke-RestMethod -Method POST -Uri $string -Headers $headers -Body $requestPayload -ContentType "application/json";
+        $Results = Invoke-GraphRequestWithThrottleHandling -Uri $string -Method "POST" -Headers $headers -Body $requestPayload -ContentType "application/json";
 
         Write-Host  $fileId 
 
@@ -202,7 +389,7 @@ function GetFileSensitivityLabel($fileId, $driveId) {
         
         Write-Host "Calling API: $uri" -ForegroundColor Yellow
         
-        $fileDetails = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers -ContentType "application/json"
+        $fileDetails = Invoke-GraphRequestWithThrottleHandling -Uri $uri -Method "GET" -Headers $headers -ContentType "application/json"
         
         # Extract sensitivity label information
         $sensitivityLabel = "No Label"
@@ -253,7 +440,7 @@ function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId 
                         Write-Host "  Getting user drive: $userDriveUri" -ForegroundColor Gray
                     }
                     
-                    $userDrive = Invoke-RestMethod -Method GET -Uri $userDriveUri -Headers $headers -ContentType "application/json"
+                    $userDrive = Invoke-GraphRequestWithThrottleHandling -Uri $userDriveUri -Method "GET" -Headers $headers -ContentType "application/json"
                     
                     if ($userDrive -and $userDrive.id) {
                         # Try to get file properties using the user's drive
@@ -262,7 +449,7 @@ function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId 
                             Write-Host "  Getting file properties: $fileInfoUri" -ForegroundColor Gray
                         }
                         
-                        $fileInfo = Invoke-RestMethod -Method GET -Uri $fileInfoUri -Headers $headers -ContentType "application/json"
+                        $fileInfo = Invoke-GraphRequestWithThrottleHandling -Uri $fileInfoUri -Method "GET" -Headers $headers -ContentType "application/json"
                         
                         if ($fileInfo) {
                             if ($debug) {
@@ -288,7 +475,7 @@ function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId 
                                     Write-Host "  Trying extractSensitivityLabels: $extractUri" -ForegroundColor Gray
                                 }
                                 
-                                $extractResult = Invoke-RestMethod -Method POST -Uri $extractUri -Headers $headers -ContentType "application/json"
+                                $extractResult = Invoke-GraphRequestWithThrottleHandling -Uri $extractUri -Method "POST" -Headers $headers -ContentType "application/json"
                                 
                                 # Check response structure
                                 if ($extractResult -and $extractResult.labels -and $extractResult.labels.Count -gt 0) {
