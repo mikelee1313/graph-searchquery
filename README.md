@@ -176,7 +176,7 @@ $searchQueryList = Get-Content 'C:\temp\userlist.txt'
 ### Get-SPOFileswithLabels.ps1
 
 **Purpose:**  
-Searches OneDrive (and SharePoint) for files of a specified type (e.g., PDF, DOCX) and extracts detailed sensitivity label information using Microsoft Graph API. Exports results to a CSV file.
+This Script searches OneDrive or SharePoint for files of a specified type (e.g., PDF, DOCX) and extracts details  and sensitivity label information using Microsoft Graph API. Exports results to a CSV file.
 
 **Features:**
 - Authenticates with Microsoft Graph via client secret or certificate
