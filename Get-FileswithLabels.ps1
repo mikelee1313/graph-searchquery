@@ -417,7 +417,9 @@ function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId 
             $userPart = $pathParts[1]  # Should be like "willb_m365cpi13246019_onmicrosoft_com"
             $filePath = "/" + ($pathParts[2..($pathParts.Length - 1)] -join "/")
             
-            Write-Host "  Parsed - Site: $siteType, User: $userPart, File: $filePath" -ForegroundColor Gray
+            if ($debug) {
+                Write-Host "  Parsed - Site: $siteType, User: $userPart, File: $filePath" -ForegroundColor Gray
+            }
             
             # Convert user part to proper email format for user API
             # Handle both onmicrosoft.com and vanity domains with comprehensive pattern matching
@@ -472,8 +474,11 @@ function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId 
                 }
             }
             
+            # Show email 
+            Write-Host "   User email: $userEmail" -ForegroundColor Cyan
+            
             if ($debug) {
-                Write-Host "  Converted user email: $userEmail" -ForegroundColor Gray
+                Write-Host "  Parsed - Site: $siteType, User: $userEmail, File: $filePath" -ForegroundColor Gray
             }
             
             $headers = @{"Authorization" = "Bearer $global:token" };
@@ -582,7 +587,7 @@ function ExportResultSet($results) {
             Write-Host "Attempting to extract sensitivity labels using Graph API for file: $($_.name)" -ForegroundColor Cyan
         }
         else {
-            Write-Host "Processing file: $($_.name)" -ForegroundColor Cyan
+            Write-Host "Processing file: $($_.webUrl)" -ForegroundColor Cyan
         }
         
         # Debug: Show the resource ID if available
