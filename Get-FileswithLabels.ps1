@@ -13,7 +13,7 @@ at the beginning of the script.
 .NOTES
 File Name       : Get-FileswithLabels.ps1
 Author          : Mike Lee
-Date Created    : 7/17/25
+Date Created    : 7/18/25
 Prerequisites   : 
 - PowerShell 5.1 or higher
 - Appropriate permissions in Azure AD (Files.Read.All, Sites.Read.All)
@@ -53,6 +53,10 @@ $tenantName = "m365cpi13246019-my"
 # Set the file type to search for (without the dot)
 # Common types: docx, pdf, xlsx, pptx, txt
 $fileType = "docx"
+
+# Enable or disable verbose debug output
+# Set to $true for detailed logging, $false for basic info only
+$debug = $false
 
 # Set the tenant ID, client ID, and client secret for authentication
 $tenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3';
@@ -160,10 +164,12 @@ function PerformSearch {
         # Export the search results to a CSV file
         if ($null -ne $Results) {
             # Add debug output to see the structure of results
-            Write-Host "Debug: Sample result structure:" -ForegroundColor Magenta
-            if ($Results.value.hitsContainers.hits.Count -gt 0) {
-                $sampleResult = $Results.value.hitsContainers.hits[0].resource
-                Write-Host "Sample resource properties: $($sampleResult.PSObject.Properties.Name -join ', ')" -ForegroundColor Magenta
+            if ($debug) {
+                Write-Host "Debug: Sample result structure:" -ForegroundColor Magenta
+                if ($Results.value.hitsContainers.hits.Count -gt 0) {
+                    $sampleResult = $Results.value.hitsContainers.hits[0].resource
+                    Write-Host "Sample resource properties: $($sampleResult.PSObject.Properties.Name -join ', ')" -ForegroundColor Magenta
+                }
             }
             
             ExportResultSet -results $Results;
@@ -228,30 +234,40 @@ function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId 
             
             # Convert user part to proper email format for user API
             $userEmail = $userPart -replace '_', '@' -replace '@onmicrosoft@com', '.onmicrosoft.com'
-            Write-Host "  Converted user email: $userEmail" -ForegroundColor Gray
+            if ($debug) {
+                Write-Host "  Converted user email: $userEmail" -ForegroundColor Gray
+            }
             
             $headers = @{"Authorization" = "Bearer $global:token" };
             
             # If we have a resource ID, try using it with user-specific endpoints
             if ($null -ne $resourceId -and $resourceId -ne "") {
-                Write-Host "  Using resource ID: $resourceId" -ForegroundColor Gray
+                if ($debug) {
+                    Write-Host "  Using resource ID: $resourceId" -ForegroundColor Gray
+                }
                 
                 # Try Method 1: Direct user drive access with resource ID
                 try {
                     $userDriveUri = "https://graph.microsoft.com/v1.0/users/$userEmail/drive"
-                    Write-Host "  Getting user drive: $userDriveUri" -ForegroundColor Gray
+                    if ($debug) {
+                        Write-Host "  Getting user drive: $userDriveUri" -ForegroundColor Gray
+                    }
                     
                     $userDrive = Invoke-RestMethod -Method GET -Uri $userDriveUri -Headers $headers -ContentType "application/json"
                     
                     if ($userDrive -and $userDrive.id) {
                         # Try to get file properties using the user's drive
                         $fileInfoUri = "https://graph.microsoft.com/v1.0/drives/$($userDrive.id)/items/$resourceId"
-                        Write-Host "  Getting file properties: $fileInfoUri" -ForegroundColor Gray
+                        if ($debug) {
+                            Write-Host "  Getting file properties: $fileInfoUri" -ForegroundColor Gray
+                        }
                         
                         $fileInfo = Invoke-RestMethod -Method GET -Uri $fileInfoUri -Headers $headers -ContentType "application/json"
                         
                         if ($fileInfo) {
-                            Write-Host "  File properties available: $($fileInfo.PSObject.Properties.Name -join ', ')" -ForegroundColor Gray
+                            if ($debug) {
+                                Write-Host "  File properties available: $($fileInfo.PSObject.Properties.Name -join ', ')" -ForegroundColor Gray
+                            }
                             
                             # Look for sensitivity label in file properties
                             if ($fileInfo.PSObject.Properties.Name -contains 'sensitivityLabel' -and $null -ne $fileInfo.sensitivityLabel) {
@@ -268,7 +284,9 @@ function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId 
                             # Try extractSensitivityLabels with user's drive
                             try {
                                 $extractUri = "https://graph.microsoft.com/v1.0/drives/$($userDrive.id)/items/$resourceId/extractSensitivityLabels"
-                                Write-Host "  Trying extractSensitivityLabels: $extractUri" -ForegroundColor Gray
+                                if ($debug) {
+                                    Write-Host "  Trying extractSensitivityLabels: $extractUri" -ForegroundColor Gray
+                                }
                                 
                                 $extractResult = Invoke-RestMethod -Method POST -Uri $extractUri -Headers $headers -ContentType "application/json"
                                 
@@ -288,80 +306,25 @@ function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId 
                                     return $sensitivityLabel
                                 }
                                 else {
-                                    Write-Host "  extractSensitivityLabels returned no labels - file has no sensitivity label applied" -ForegroundColor Yellow
+                                    if ($debug) {
+                                        Write-Host "  extractSensitivityLabels returned no labels - file has no sensitivity label applied" -ForegroundColor Yellow
+                                    }
                                     return "No Label"
                                 }
                             }
                             catch {
                                 $statusCode = $_.Exception.Response.StatusCode.value__ 
-                                Write-Host "  extractSensitivityLabels failed: $statusCode - $($_.Exception.Message)" -ForegroundColor Yellow
-                            }
-                        }
-                    }
-                }
-                catch {
-                    Write-Host "  User drive access failed: $($_.Exception.Message)" -ForegroundColor Yellow
-                }
-                
-                # Try Method 2: Site-based approach as fallback
-                try {
-                    $siteUri = "https://graph.microsoft.com/v1.0/sites/m365cpi13246019-my.sharepoint.com:/personal/$userPart"
-                    Write-Host "  Trying site API: $siteUri" -ForegroundColor Gray
-                
-                    $siteInfo = Invoke-RestMethod -Method GET -Uri $siteUri -Headers $headers -ContentType "application/json"
-                
-                    if ($siteInfo -and $siteInfo.id) {
-                        $driveUri = "https://graph.microsoft.com/v1.0/sites/$($siteInfo.id)/drives"
-                        $drives = Invoke-RestMethod -Method GET -Uri $driveUri -Headers $headers -ContentType "application/json"
-                    
-                        if ($drives.value -and $drives.value.Count -gt 0) {
-                            $driveId = $drives.value[0].id
-                        
-                            # If we have a resource ID, try using it with the site drive
-                            if ($null -ne $resourceId -and $resourceId -ne "") {
-                                try {
-                                    $fileInfoUri = "https://graph.microsoft.com/v1.0/drives/$driveId/items/$resourceId"
-                                    Write-Host "  Getting file info from site drive: $fileInfoUri" -ForegroundColor Gray
-                                
-                                    $fileInfo = Invoke-RestMethod -Method GET -Uri $fileInfoUri -Headers $headers -ContentType "application/json"
-                                
-                                    if ($fileInfo) {
-                                        # Look for sensitivity label in file properties
-                                        if ($fileInfo.PSObject.Properties.Name -contains 'sensitivityLabel' -and $null -ne $fileInfo.sensitivityLabel) {
-                                            $sensitivityLabel = $fileInfo.sensitivityLabel.displayName
-                                            Write-Host "  Found sensitivity label in site file properties: $sensitivityLabel" -ForegroundColor Green
-                                            return $sensitivityLabel
-                                        }
-                                    
-                                        # Try extractSensitivityLabels
-                                        try {
-                                            $extractUri = "https://graph.microsoft.com/v1.0/drives/$driveId/items/$resourceId/extractSensitivityLabels"
-                                            Write-Host "  Trying site extractSensitivityLabels: $extractUri" -ForegroundColor Gray
-                                        
-                                            $extractResult = Invoke-RestMethod -Method POST -Uri $extractUri -Headers $headers -ContentType "application/json"
-                                        
-                                            if ($extractResult -and $extractResult.value -and $extractResult.value.labels -and $extractResult.value.labels.Count -gt 0) {
-                                                $sensitivityLabelId = $extractResult.value.labels[0].sensitivityLabelId
-                                                $assignmentMethod = $extractResult.value.labels[0].assignmentMethod
-                                                $sensitivityLabel = "Label ID: $sensitivityLabelId ($assignmentMethod)"
-                                                Write-Host "  Found sensitivity label via site extractSensitivityLabels: $sensitivityLabel" -ForegroundColor Green
-                                                return $sensitivityLabel
-                                            }
-                                        }
-                                        catch {
-                                            Write-Host "  Site extractSensitivityLabels failed: $($_.Exception.Message)" -ForegroundColor Yellow
-                                        }
-                                    }
-                                }
-                                catch {
-                                    Write-Host "  Site file access failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                                if ($debug) {
+                                    Write-Host "  extractSensitivityLabels failed: $statusCode - $($_.Exception.Message)" -ForegroundColor Yellow
                                 }
                             }
                         }
                     }
                 }
                 catch {
-                    Write-Host "  Site-based approach failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                    if ($debug) {
+                        Write-Host "  User drive access failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                    }
                 }
             }
         }
@@ -377,10 +340,15 @@ function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId 
 # This function extracts relevant fields from the search results and appends them to the CSV file
 function ExportResultSet($results) {
     $Results.value.hitsContainers.hits.resource | ForEach-Object {
-        Write-Host "Attempting to extract sensitivity labels using Graph API for file: $($_.name)" -ForegroundColor Cyan
+        if ($debug) {
+            Write-Host "Attempting to extract sensitivity labels using Graph API for file: $($_.name)" -ForegroundColor Cyan
+        }
+        else {
+            Write-Host "Processing file: $($_.name)" -ForegroundColor Cyan
+        }
         
         # Debug: Show the resource ID if available
-        if ($_.PSObject.Properties.Name -contains 'id') {
+        if ($debug -and $_.PSObject.Properties.Name -contains 'id') {
             Write-Host "  Resource ID: $($_.id)" -ForegroundColor Gray
         }
         
@@ -391,7 +359,9 @@ function ExportResultSet($results) {
                 # Decode the URL
                 $relativePath = [System.Web.HttpUtility]::UrlDecode($uri.AbsolutePath)
                 
-                Write-Host "  File path: $relativePath" -ForegroundColor Gray
+                if ($debug) {
+                    Write-Host "  File path: $relativePath" -ForegroundColor Gray
+                }
                 
                 # Try to get the file using extractSensitivityLabels API
                 # Pass the resource ID if available
