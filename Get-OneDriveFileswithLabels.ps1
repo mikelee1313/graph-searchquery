@@ -11,7 +11,7 @@ This script does not accept parameters through the command line. Configuration i
 at the beginning of the script.
 
 .NOTES
-File Name       : Get-FileswithLabels.ps1
+File Name       : Get-OneDriveFileswithLabels.ps1
 Author          : Mike Lee
 Date Created    : 7/18/25
 Prerequisites   : 
