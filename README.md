@@ -195,7 +195,7 @@ Searches OneDrive (and SharePoint) for files of a specified type (e.g., PDF, DOC
 - `debug`: Verbose output (`$true`/`$false`)
 
 **Output:**  
-- CSV file in your `%TEMP%` directory, named `OneDrive_Search_Results_<timestamp>.csv`.  
+- CSV file in your `%TEMP%` directory, named `SPOFileswithLabels_Search_Results_<timestamp>.csv`.  
   Columns:  
   - `ID`
   - `Name`
