@@ -11,16 +11,22 @@ This script does not accept parameters through the command line. Configuration i
 at the beginning of the script.
 
 .NOTES
-File Name       : Get-OneDriveFileswithLabels.ps1
+File Name       : Get-SPOFileswithLabels.ps1
 Author          : Mike Lee
 Date Created    : 7/18/25
 Prerequisites   : 
 - PowerShell 5.1 or higher
-- Appropriate permissions in Azure AD (Files.Read.All, Sites.Read.All)
+- Appropriate permissions in Azure AD 
+
+API Permissions Required:
+- Sites.Read.All (for both OneDrive and SharePoint sites)
+- Files.Read.All (for file access)
+- InformationProtectionPolicy.Read.All (for sensitivity labels)
+
 - Microsoft Graph API access
 
 .EXAMPLE
-PS> .\Get-FileswithLabels.ps1
+PS> .\Get-SPOFileswithLabels.ps1
 Performs the search and exports results to a CSV file in the %TEMP% directory.
 
 .OUTPUTS
@@ -405,168 +411,171 @@ function GetFileSensitivityLabel($fileId, $driveId) {
     }
 }
 
-function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId = $null) {
+function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId = $null, $webUrl = $null) {
     try {
-        # With application-only tokens, we cannot use /me endpoints
-        # We need to extract user information and use user-specific or site-specific endpoints
+        # Handle both OneDrive personal sites and regular SharePoint Online sites
+        # OneDrive personal sites: /personal/user_domain_com/...
+        # SharePoint sites: /sites/sitename/... or /teams/teamname/...
         
-        # Extract user information from the relative path
+        # Extract site information from the relative path
         $pathParts = $relativePath.TrimStart('/').Split('/')
         if ($pathParts.Length -ge 3) {
-            $siteType = $pathParts[0]  # Should be "personal" 
-            $userPart = $pathParts[1]  # Should be like "willb_m365cpi13246019_onmicrosoft_com"
+            $siteType = $pathParts[0]  # Could be "personal", "sites", "teams", etc.
+            $siteIdentifier = $pathParts[1]  # User part or site name
             $filePath = "/" + ($pathParts[2..($pathParts.Length - 1)] -join "/")
             
             if ($debug) {
-                Write-Host "  Parsed - Site: $siteType, User: $userPart, File: $filePath" -ForegroundColor Gray
-            }
-            
-            # Convert user part to proper email format for user API
-            # Handle both onmicrosoft.com and vanity domains with comprehensive pattern matching
-            # Examples:
-            # - "Will_Bob_m365cpi13246019_onmicrosoft_com" -> "Will.Bob@m365cpi13246019.onmicrosoft.com"
-            # - "Will_Bob_contoso_com" -> "Will.Bob@contoso.com"
-            # - "user_one_abc-123_com" -> "user.one@abc-123.com"
-            # - "john_doe_company_org" -> "john.doe@company.org"
-            
-            if ($userPart -match '_onmicrosoft_com$') {
-                # Handle onmicrosoft.com domains
-                $userEmail = $userPart -replace '_onmicrosoft_com$', '.onmicrosoft.com'  # Fix the domain suffix first
-                $userEmail = $userEmail -replace '_([^_]+)\.onmicrosoft\.com$', '@$1.onmicrosoft.com'  # Replace the last underscore before domain with @
-                $userEmail = $userEmail -replace '_', '.'  # Convert remaining underscores to dots (for names like Will_Bob -> Will.Bob)
-            }
-            else {
-                # Handle all other domains with a more comprehensive approach
-                # This regex captures the domain and TLD parts more flexibly
-                # Pattern: username_parts_domain_tld where domain can contain hyphens and numbers
-                
-                # First, identify the TLD (last part after final underscore)
-                $tldMatch = $userPart -match '.*_([a-zA-Z]{2,})$'
-                if ($tldMatch) {
-                    $tld = $matches[1]
-                    $withoutTld = $userPart -replace "_$tld$", ""
-                    
-                    # Now find the domain part (everything after the last underscore in the remaining string)
-                    $domainMatch = $withoutTld -match '(.*)_([a-zA-Z0-9\-]+)$'
-                    if ($domainMatch) {
-                        $usernamePart = $matches[1]
-                        $domainPart = $matches[2]
-                        
-                        # Convert username underscores to dots and construct email
-                        $userEmail = ($usernamePart -replace '_', '.') + "@" + $domainPart + "." + $tld
-                    }
-                    else {
-                        # Fallback: treat the part before TLD as domain
-                        $userEmail = $withoutTld -replace '_([^_]+)$', '@$1' -replace '_', '.'
-                        $userEmail = $userEmail + "." + $tld
-                    }
-                }
-                else {
-                    # Final fallback: simple pattern replacement for cases without clear TLD
-                    $userEmail = $userPart -replace '_', '@' -replace '@@', '@'
-                    # Convert remaining underscores to dots after the @ symbol
-                    if ($userEmail -match '@') {
-                        $parts = $userEmail -split '@'
-                        if ($parts.Length -eq 2) {
-                            $userEmail = ($parts[0] -replace '_', '.') + '@' + ($parts[1] -replace '_', '.')
-                        }
-                    }
-                }
-            }
-            
-            # Show email 
-            Write-Host "   User email: $userEmail" -ForegroundColor Cyan
-            
-            if ($debug) {
-                Write-Host "  Parsed - Site: $siteType, User: $userEmail, File: $filePath" -ForegroundColor Gray
+                Write-Host "  Parsed - Site Type: $siteType, Identifier: $siteIdentifier, File: $filePath" -ForegroundColor Gray
             }
             
             $headers = @{"Authorization" = "Bearer $global:token" };
             
-            # If we have a resource ID, try using it with user-specific endpoints
-            if ($null -ne $resourceId -and $resourceId -ne "") {
-                if ($debug) {
-                    Write-Host "  Using resource ID: $resourceId" -ForegroundColor Gray
+            # Handle OneDrive personal sites
+            if ($siteType -eq "personal") {
+                # Convert user part to proper email format for user API
+                # Handle both onmicrosoft.com and vanity domains with comprehensive pattern matching
+                
+                if ($siteIdentifier -match '_onmicrosoft_com$') {
+                    # Handle onmicrosoft.com domains
+                    $userEmail = $siteIdentifier -replace '_onmicrosoft_com$', '.onmicrosoft.com'  # Fix the domain suffix first
+                    $userEmail = $userEmail -replace '_([^_]+)\.onmicrosoft\.com$', '@$1.onmicrosoft.com'  # Replace the last underscore before domain with @
+                    $userEmail = $userEmail -replace '_', '.'  # Convert remaining underscores to dots (for names like Will_Bob -> Will.Bob)
+                }
+                else {
+                    # Handle all other domains with a more comprehensive approach
+                    # This regex captures the domain and TLD parts more flexibly
+                    # Pattern: username_parts_domain_tld where domain can contain hyphens and numbers
+                    
+                    # First, identify the TLD (last part after final underscore)
+                    $tldMatch = $siteIdentifier -match '.*_([a-zA-Z]{2,})$'
+                    if ($tldMatch) {
+                        $tld = $matches[1]
+                        $withoutTld = $siteIdentifier -replace "_$tld$", ""
+                        
+                        # Now find the domain part (everything after the last underscore in the remaining string)
+                        $domainMatch = $withoutTld -match '(.*)_([a-zA-Z0-9\-]+)$'
+                        if ($domainMatch) {
+                            $usernamePart = $matches[1]
+                            $domainPart = $matches[2]
+                            
+                            # Convert username underscores to dots and construct email
+                            $userEmail = ($usernamePart -replace '_', '.') + "@" + $domainPart + "." + $tld
+                        }
+                        else {
+                            # Fallback: treat the part before TLD as domain
+                            $userEmail = $withoutTld -replace '_([^_]+)$', '@$1' -replace '_', '.'
+                            $userEmail = $userEmail + "." + $tld
+                        }
+                    }
+                    else {
+                        # Final fallback: simple pattern replacement for cases without clear TLD
+                        $userEmail = $siteIdentifier -replace '_', '@' -replace '@@', '@'
+                        # Convert remaining underscores to dots after the @ symbol
+                        if ($userEmail -match '@') {
+                            $parts = $userEmail -split '@'
+                            if ($parts.Length -eq 2) {
+                                $userEmail = ($parts[0] -replace '_', '.') + '@' + ($parts[1] -replace '_', '.')
+                            }
+                        }
+                    }
                 }
                 
-                # Try Method 1: Direct user drive access with resource ID
-                try {
-                    $userDriveUri = "https://graph.microsoft.com/v1.0/users/$userEmail/drive"
+                # Show email 
+                Write-Host "   User email: $userEmail" -ForegroundColor Cyan
+                
+                # Try OneDrive personal site approach
+                if ($null -ne $resourceId -and $resourceId -ne "") {
                     if ($debug) {
-                        Write-Host "  Getting user drive: $userDriveUri" -ForegroundColor Gray
+                        Write-Host "  Using OneDrive personal site approach with resource ID: $resourceId" -ForegroundColor Gray
                     }
                     
-                    $userDrive = Invoke-GraphRequestWithThrottleHandling -Uri $userDriveUri -Method "GET" -Headers $headers -ContentType "application/json"
-                    
-                    if ($userDrive -and $userDrive.id) {
-                        # Try to get file properties using the user's drive
-                        $fileInfoUri = "https://graph.microsoft.com/v1.0/drives/$($userDrive.id)/items/$resourceId"
+                    try {
+                        $userDriveUri = "https://graph.microsoft.com/v1.0/users/$userEmail/drive"
                         if ($debug) {
-                            Write-Host "  Getting file properties: $fileInfoUri" -ForegroundColor Gray
+                            Write-Host "  Getting user drive: $userDriveUri" -ForegroundColor Gray
                         }
                         
-                        $fileInfo = Invoke-GraphRequestWithThrottleHandling -Uri $fileInfoUri -Method "GET" -Headers $headers -ContentType "application/json"
+                        $userDrive = Invoke-GraphRequestWithThrottleHandling -Uri $userDriveUri -Method "GET" -Headers $headers -ContentType "application/json"
                         
-                        if ($fileInfo) {
+                        if ($userDrive -and $userDrive.id) {
+                            # Try to get file properties using the user's drive
+                            $fileInfoUri = "https://graph.microsoft.com/v1.0/drives/$($userDrive.id)/items/$resourceId"
                             if ($debug) {
-                                Write-Host "  File properties available: $($fileInfo.PSObject.Properties.Name -join ', ')" -ForegroundColor Gray
+                                Write-Host "  Getting file properties: $fileInfoUri" -ForegroundColor Gray
                             }
                             
-                            # Look for sensitivity label in file properties
-                            if ($fileInfo.PSObject.Properties.Name -contains 'sensitivityLabel' -and $null -ne $fileInfo.sensitivityLabel) {
-                                $sensitivityLabel = $fileInfo.sensitivityLabel.displayName
-                                Write-Host "  Found sensitivity label in file properties: $sensitivityLabel" -ForegroundColor Green
-                                return $sensitivityLabel
-                            }
-                            elseif ($fileInfo.PSObject.Properties.Name -contains 'classification' -and $null -ne $fileInfo.classification) {
-                                $sensitivityLabel = $fileInfo.classification
-                                Write-Host "  Found classification in file properties: $sensitivityLabel" -ForegroundColor Green
-                                return $sensitivityLabel
-                            }
+                            $fileInfo = Invoke-GraphRequestWithThrottleHandling -Uri $fileInfoUri -Method "GET" -Headers $headers -ContentType "application/json"
                             
-                            # Try extractSensitivityLabels with user's drive
-                            try {
-                                $extractUri = "https://graph.microsoft.com/v1.0/drives/$($userDrive.id)/items/$resourceId/extractSensitivityLabels"
-                                if ($debug) {
-                                    Write-Host "  Trying extractSensitivityLabels: $extractUri" -ForegroundColor Gray
-                                }
-                                
-                                $extractResult = Invoke-GraphRequestWithThrottleHandling -Uri $extractUri -Method "POST" -Headers $headers -ContentType "application/json"
-                                
-                                # Check response structure
-                                if ($extractResult -and $extractResult.labels -and $extractResult.labels.Count -gt 0) {
-                                    $sensitivityLabelId = $extractResult.labels[0].sensitivityLabelId
-                                    $assignmentMethod = $extractResult.labels[0].assignmentMethod
-                                    $sensitivityLabel = "Label ID: $sensitivityLabelId ($assignmentMethod)"
-                                    Write-Host "  Found sensitivity label via extractSensitivityLabels: $sensitivityLabel" -ForegroundColor Green
-                                    return $sensitivityLabel
-                                }
-                                elseif ($extractResult -and $extractResult.labels -and $extractResult.labels.Count -gt 0) {
-                                    $sensitivityLabelId = $extractResult.labels[0].sensitivityLabelId
-                                    $assignmentMethod = $extractResult.labels[0].assignmentMethod
-                                    $sensitivityLabel = "Label ID: $sensitivityLabelId ($assignmentMethod)"
-                                    Write-Host "  Found sensitivity label via extractSensitivityLabels (alt): $sensitivityLabel" -ForegroundColor Green
-                                    return $sensitivityLabel
-                                }
-                                else {
-                                    if ($debug) {
-                                        Write-Host "  extractSensitivityLabels returned no labels - file has no sensitivity label applied" -ForegroundColor Yellow
-                                    }
-                                    return "No Label"
-                                }
+                            if ($fileInfo) {
+                                return ProcessFileForSensitivityLabel -fileInfo $fileInfo -userDrive $userDrive -resourceId $resourceId -headers $headers
                             }
-                            catch {
-                                $statusCode = $_.Exception.Response.StatusCode.value__ 
-                                if ($debug) {
-                                    Write-Host "  extractSensitivityLabels failed: $statusCode - $($_.Exception.Message)" -ForegroundColor Yellow
-                                }
-                            }
+                        }
+                    }
+                    catch {
+                        if ($debug) {
+                            Write-Host "  OneDrive personal site access failed: $($_.Exception.Message)" -ForegroundColor Yellow
                         }
                     }
                 }
-                catch {
+            }
+            # Handle SharePoint Online sites (sites, teams, etc.)
+            else {
+                Write-Host "   SharePoint site: $siteIdentifier" -ForegroundColor Cyan
+                
+                if ($null -ne $resourceId -and $resourceId -ne "" -and $null -ne $webUrl) {
                     if ($debug) {
-                        Write-Host "  User drive access failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                        Write-Host "  Using SharePoint site approach with resource ID: $resourceId" -ForegroundColor Gray
+                    }
+                    
+                    try {
+                        # Extract the site URL from the webUrl
+                        $uri = [System.Uri]$webUrl
+                        $siteUrl = $uri.Scheme + "://" + $uri.Host + "/" + $pathParts[0] + "/" + $pathParts[1]
+                        
+                        if ($debug) {
+                            Write-Host "  Site URL: $siteUrl" -ForegroundColor Gray
+                        }
+                        
+                        # Get the site ID using the site URL 
+                        $siteInfoUri = "https://graph.microsoft.com/v1.0/sites/$($uri.Host):$($uri.AbsolutePath.Split('/')[1])/$($uri.AbsolutePath.Split('/')[2])"
+                        
+                        # Alternative approach: use the hostname and path
+                        $siteInfoUri = "https://graph.microsoft.com/v1.0/sites/$($uri.Host):/sites/$siteIdentifier"
+                        
+                        if ($debug) {
+                            Write-Host "  Getting site info: $siteInfoUri" -ForegroundColor Gray
+                        }
+                        
+                        $siteInfo = Invoke-GraphRequestWithThrottleHandling -Uri $siteInfoUri -Method "GET" -Headers $headers -ContentType "application/json"
+                        
+                        if ($siteInfo -and $siteInfo.id) {
+                            # Get the default drive for the site
+                            $siteDefaultDriveUri = "https://graph.microsoft.com/v1.0/sites/$($siteInfo.id)/drive"
+                            if ($debug) {
+                                Write-Host "  Getting site default drive: $siteDefaultDriveUri" -ForegroundColor Gray
+                            }
+                            
+                            $siteDrive = Invoke-GraphRequestWithThrottleHandling -Uri $siteDefaultDriveUri -Method "GET" -Headers $headers -ContentType "application/json"
+                            
+                            if ($siteDrive -and $siteDrive.id) {
+                                # Try to get file properties using the site's drive
+                                $fileInfoUri = "https://graph.microsoft.com/v1.0/drives/$($siteDrive.id)/items/$resourceId"
+                                if ($debug) {
+                                    Write-Host "  Getting file properties: $fileInfoUri" -ForegroundColor Gray
+                                }
+                                
+                                $fileInfo = Invoke-GraphRequestWithThrottleHandling -Uri $fileInfoUri -Method "GET" -Headers $headers -ContentType "application/json"
+                                
+                                if ($fileInfo) {
+                                    return ProcessFileForSensitivityLabel -fileInfo $fileInfo -userDrive $siteDrive -resourceId $resourceId -headers $headers
+                                }
+                            }
+                        }
+                    }
+                    catch {
+                        if ($debug) {
+                            Write-Host "  SharePoint site access failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                        }
                     }
                 }
             }
@@ -577,6 +586,57 @@ function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId 
     catch {
         Write-Warning "GetSensitivityLabelViaExtractAPI failed for file: $fileName. Error: $($_.Exception.Message)"
         return "API access failed"
+    }
+}
+
+# Helper function to process file for sensitivity label (common logic for both OneDrive and SharePoint)
+function ProcessFileForSensitivityLabel($fileInfo, $userDrive, $resourceId, $headers) {
+    if ($debug) {
+        Write-Host "  File properties available: $($fileInfo.PSObject.Properties.Name -join ', ')" -ForegroundColor Gray
+    }
+    
+    # Look for sensitivity label in file properties
+    if ($fileInfo.PSObject.Properties.Name -contains 'sensitivityLabel' -and $null -ne $fileInfo.sensitivityLabel) {
+        $sensitivityLabel = $fileInfo.sensitivityLabel.displayName
+        Write-Host "  Found sensitivity label in file properties: $sensitivityLabel" -ForegroundColor Green
+        return $sensitivityLabel
+    }
+    elseif ($fileInfo.PSObject.Properties.Name -contains 'classification' -and $null -ne $fileInfo.classification) {
+        $sensitivityLabel = $fileInfo.classification
+        Write-Host "  Found classification in file properties: $sensitivityLabel" -ForegroundColor Green
+        return $sensitivityLabel
+    }
+    
+    # Try extractSensitivityLabels with the drive
+    try {
+        $extractUri = "https://graph.microsoft.com/v1.0/drives/$($userDrive.id)/items/$resourceId/extractSensitivityLabels"
+        if ($debug) {
+            Write-Host "  Trying extractSensitivityLabels: $extractUri" -ForegroundColor Gray
+        }
+        
+        $extractResult = Invoke-GraphRequestWithThrottleHandling -Uri $extractUri -Method "POST" -Headers $headers -ContentType "application/json"
+        
+        # Check response structure
+        if ($extractResult -and $extractResult.labels -and $extractResult.labels.Count -gt 0) {
+            $sensitivityLabelId = $extractResult.labels[0].sensitivityLabelId
+            $assignmentMethod = $extractResult.labels[0].assignmentMethod
+            $sensitivityLabel = "Label ID: $sensitivityLabelId ($assignmentMethod)"
+            Write-Host "  Found sensitivity label via extractSensitivityLabels: $sensitivityLabel" -ForegroundColor Green
+            return $sensitivityLabel
+        }
+        else {
+            if ($debug) {
+                Write-Host "  extractSensitivityLabels returned no labels - file has no sensitivity label applied" -ForegroundColor Yellow
+            }
+            return "No Label"
+        }
+    }
+    catch {
+        $statusCode = $_.Exception.Response.StatusCode.value__ 
+        if ($debug) {
+            Write-Host "  extractSensitivityLabels failed: $statusCode - $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+        return "No Label"
     }
 }
 
@@ -607,9 +667,9 @@ function ExportResultSet($results) {
                 }
                 
                 # Try to get the file using extractSensitivityLabels API
-                # Pass the resource ID if available
+                # Pass the resource ID and webUrl if available
                 $resourceId = if ($_.PSObject.Properties.Name -contains 'id') { $_.id } else { $null }
-                $sensitivityLabel = GetSensitivityLabelViaExtractAPI -relativePath $relativePath -fileName $_.name -resourceId $resourceId
+                $sensitivityLabel = GetSensitivityLabelViaExtractAPI -relativePath $relativePath -fileName $_.name -resourceId $resourceId -webUrl $_.webUrl
             }
             catch {
                 Write-Warning "Could not parse webUrl for file: $($_.name). Error: $($_.Exception.Message)"
