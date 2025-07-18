@@ -1,10 +1,6 @@
-Certainly! Here is a detailed README for the scripts you provided in your repo **mikelee1313/graph-searchquery**. This README explains the purpose, usage, parameters, prerequisites, and output of each script, organized for clarity and ease of use.
-
----
-
 # SharePoint & OneDrive Microsoft Graph Search Scripts
 
-This repository contains PowerShell scripts for querying and reporting on SharePoint Online and OneDrive data using the Microsoft Graph API. These scripts are designed for administrative and security/compliance teams to search, inventory, and download data related to SharePoint Copilot Agents and general OneDrive/SharePoint content.
+This repository contains PowerShell scripts for querying and reporting on SharePoint Online and OneDrive data using the Microsoft Graph API. These scripts are designed for administrative and security/reporting purposes.
 
 ## Table of Contents
 
@@ -16,6 +12,7 @@ This repository contains PowerShell scripts for querying and reporting on ShareP
   - [TenantWide_SP_Copilot_Agents_Insights.ps1](#tenantwide_sp_copilot_agents_insightsps1)
   - [search-spo_odb.ps1](#search-spo_odbps1)
   - [search_and_download.ps1](#search_and_downloadps1)
+  - [Get-SPOFileswithLabels.ps1](#get-spofileswithlabelssps1)
 - [Disclaimer](#disclaimer)
 - [Authors](#authors)
 
@@ -28,6 +25,7 @@ These scripts use the Microsoft Graph API to:
 - Generate detailed CSV and log reports about Copilot Agents, including security and site metadata.
 - Perform bulk searches on SharePoint/OneDrive items using custom queries.
 - Download files found via search queries, if desired.
+- Extract sensitivity labels from OneDrive/SharePoint files.
 
 All scripts support secure authentication and pagination of large result sets.
 
@@ -35,7 +33,7 @@ All scripts support secure authentication and pagination of large result sets.
 
 ## Prerequisites
 
-- **PowerShell 7.x** recommended.
+- **PowerShell 7.x** recommended (PowerShell 5.1 or higher required for some scripts).
 - **PnP.PowerShell module** (for insights script):  
   Install with `Install-Module -Name PnP.PowerShell -Scope CurrentUser`
 - A **registered Azure AD/Entra application** with permissions:
@@ -43,6 +41,7 @@ All scripts support secure authentication and pagination of large result sets.
   - `Sites.FullControl.All` (for insights)
   - `Files.Read.All` (for OneDrive/SharePoint search)
   - `SearchQuery.All`
+  - `InformationProtectionPolicy.Read.All` (for sensitivity labels)
 - **Certificate-based authentication** recommended for the Insights script.
 - Appropriate admin rights for the SharePoint tenant and the Entra app registration.
 
@@ -174,6 +173,58 @@ $searchQueryList = Get-Content 'C:\temp\userlist.txt'
 
 ---
 
+### Get-SPOFileswithLabels.ps1
+
+**Purpose:**  
+Searches OneDrive (and SharePoint) for files of a specified type (e.g., PDF, DOCX) and extracts detailed sensitivity label information using Microsoft Graph API. Exports results to a CSV file.
+
+**Features:**
+- Authenticates with Microsoft Graph via client secret or certificate
+- Supports file type filtering (e.g., pdf, docx, xlsx)
+- Handles throttling and pagination for large result sets
+- Extracts sensitivity labels and key file metadata
+- Outputs results to a timestamped CSV file
+
+**Parameters:**
+- `tenantName`: Tenant short name (e.g., "contoso")
+- `tenantId`, `clientId`, `clientSecret`: Azure AD app credentials
+- `AuthType`: `'ClientSecret'` or `'Certificate'`
+- `Thumbprint`, `CertStore`: Certificate details (if using certificate auth)
+- `fileType`: File extension to search for (e.g., `"pdf"`)
+- `searchRegion`: Search region (default `"NAM"`)
+- `debug`: Verbose output (`$true`/`$false`)
+
+**Output:**  
+- CSV file in your `%TEMP%` directory, named `OneDrive_Search_Results_<timestamp>.csv`.  
+  Columns:  
+  - `ID`
+  - `Name`
+  - `WebURL`
+  - `CreatedDate`
+  - `LastAccessedDate`
+  - `Owner`
+  - `SensitivityLabel`
+
+**Usage Example:**
+```powershell
+# Set your credentials and desired fileType at the top of the script
+./Get-SPOFileswithLabels.ps1
+```
+
+**Prerequisites:**
+- PowerShell 5.1 or higher
+- Azure AD application with API permissions:
+  - `Sites.Read.All`
+  - `Files.Read.All`
+  - `InformationProtectionPolicy.Read.All`
+- Microsoft Graph API access
+
+**Documentation:**  
+- [Microsoft Graph Search API Overview](https://learn.microsoft.com/en-us/graph/api/resources/search-api-overview)
+- [Extract Sensitivity Labels API](https://learn.microsoft.com/en-us/graph/api/driveitem-extractsensitivitylabels?view=graph-rest-1.0&tabs=http)
+
+---
+
 ## Disclaimer
 
 The sample scripts are provided **AS IS** without warranty of any kind.  
@@ -192,8 +243,3 @@ For questions, open an issue or contact the authors via GitHub.
 
 ---
 
-**Happy searching and reporting!**
-
----
-
-Let me know if you want a shorter README, or if you need examples or troubleshooting sections added.
