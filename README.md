@@ -15,7 +15,6 @@ This repository contains PowerShell scripts for querying and reporting on ShareP
   - [Get-SPOFileswithLabels.ps1](#get-spofileswithlabelsps1)
   - [Convert-SPOfiles.ps1](#convert-spofilesps1)
 - [Disclaimer](#disclaimer)
-- [Authors](#authors)
 
 ---
 
