@@ -420,10 +420,12 @@ function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId 
             Write-Host "  Parsed - Site: $siteType, User: $userPart, File: $filePath" -ForegroundColor Gray
             
             # Convert user part to proper email format for user API
-            # Handle both onmicrosoft.com and vanity domains
+            # Handle both onmicrosoft.com and vanity domains with comprehensive pattern matching
             # Examples:
             # - "Will_Bob_m365cpi13246019_onmicrosoft_com" -> "Will.Bob@m365cpi13246019.onmicrosoft.com"
             # - "Will_Bob_contoso_com" -> "Will.Bob@contoso.com"
+            # - "user_one_abc-123_com" -> "user.one@abc-123.com"
+            # - "john_doe_company_org" -> "john.doe@company.org"
             
             if ($userPart -match '_onmicrosoft_com$') {
                 # Handle onmicrosoft.com domains
@@ -431,21 +433,43 @@ function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId 
                 $userEmail = $userEmail -replace '_([^_]+)\.onmicrosoft\.com$', '@$1.onmicrosoft.com'  # Replace the last underscore before domain with @
                 $userEmail = $userEmail -replace '_', '.'  # Convert remaining underscores to dots (for names like Will_Bob -> Will.Bob)
             }
-            elseif ($userPart -match '_([^_]+)_com$') {
-                # Handle vanity domains like contoso.com
-                $userEmail = $userPart -replace '_com$', '.com'  # Fix the domain suffix first
-                $userEmail = $userEmail -replace '_([^_]+)\.com$', '@$1.com'  # Replace the last underscore before domain with @
-                $userEmail = $userEmail -replace '_', '.'  # Convert remaining underscores to dots
-            }
-            elseif ($userPart -match '_([^_]+)_([^_]+)$') {
-                # Handle other TLDs like .org, .net, etc.
-                # Pattern: user_domain_tld -> user@domain.tld
-                $userEmail = $userPart -replace '_([^_]+)_([^_]+)$', '@$1.$2'  # Replace last two underscores with @domain.tld
-                $userEmail = $userEmail -replace '_', '.'  # Convert remaining underscores to dots
-            }
             else {
-                # Fallback: treat as simple name_domain pattern
-                $userEmail = $userPart -replace '_', '@' -replace '@@', '@'  # Simple replacement with duplicate @ cleanup
+                # Handle all other domains with a more comprehensive approach
+                # This regex captures the domain and TLD parts more flexibly
+                # Pattern: username_parts_domain_tld where domain can contain hyphens and numbers
+                
+                # First, identify the TLD (last part after final underscore)
+                $tldMatch = $userPart -match '.*_([a-zA-Z]{2,})$'
+                if ($tldMatch) {
+                    $tld = $matches[1]
+                    $withoutTld = $userPart -replace "_$tld$", ""
+                    
+                    # Now find the domain part (everything after the last underscore in the remaining string)
+                    $domainMatch = $withoutTld -match '(.*)_([a-zA-Z0-9\-]+)$'
+                    if ($domainMatch) {
+                        $usernamePart = $matches[1]
+                        $domainPart = $matches[2]
+                        
+                        # Convert username underscores to dots and construct email
+                        $userEmail = ($usernamePart -replace '_', '.') + "@" + $domainPart + "." + $tld
+                    }
+                    else {
+                        # Fallback: treat the part before TLD as domain
+                        $userEmail = $withoutTld -replace '_([^_]+)$', '@$1' -replace '_', '.'
+                        $userEmail = $userEmail + "." + $tld
+                    }
+                }
+                else {
+                    # Final fallback: simple pattern replacement for cases without clear TLD
+                    $userEmail = $userPart -replace '_', '@' -replace '@@', '@'
+                    # Convert remaining underscores to dots after the @ symbol
+                    if ($userEmail -match '@') {
+                        $parts = $userEmail -split '@'
+                        if ($parts.Length -eq 2) {
+                            $userEmail = ($parts[0] -replace '_', '.') + '@' + ($parts[1] -replace '_', '.')
+                        }
+                    }
+                }
             }
             
             if ($debug) {
