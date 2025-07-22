@@ -103,9 +103,6 @@ $date = Get-Date -Format "yyyyMMddHHmmss";
 # The log file will store the search results including sensitivity labels in CSV format
 $LogName = Join-Path -Path $env:TEMP -ChildPath ("SPOFileswithLabels_Search_Results_" + $date + ".csv");
 
-# Progress checkpoint file to allow resuming if the script is interrupted
-$ProgressFile = Join-Path -Path $env:TEMP -ChildPath ("SPOFileswithLabels_Progress_" + $date + ".json");
-
 # Initialize global variables for the token and search results
 $global:token = @();
 $global:tokenExpiry = $null;
@@ -483,16 +480,6 @@ function PerformSearch {
                 Write-Host -ForegroundColor Cyan "Waiting $delayBetweenBatches seconds before next batch to avoid rate limiting..."
                 Start-Sleep -Seconds $delayBetweenBatches
             }
-            
-            # Save progress checkpoint
-            $progressData = @{
-                LastBatchCompleted = $i
-                LastStartPosition  = $start
-                TotalProcessed     = $totalProcessed
-                Timestamp          = (Get-Date).ToString()
-                BatchSize          = $size
-            }
-            $progressData | ConvertTo-Json | Set-Content -Path $ProgressFile
             
             Write-Host ""
         }
