@@ -14,6 +14,7 @@ at the beginning of the script.
 File Name       : Get-SPOFileswithLabels.ps1
 Author          : Mike Lee
 Date Created    : 7/18/25
+Date Updated    : 7/22/25
 Prerequisites   : 
 - PowerShell 5.1 or higher
 - Appropriate permissions in Azure AD 
@@ -70,7 +71,12 @@ $tenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3';
 $clientId = 'abc64618-283f-47ba-a185-50d935d51d57';
 
 # Authentication type: Choose 'ClientSecret' or 'Certificate'
-$AuthType = 'ClientSecret'  # Valid values: 'ClientSecret' or 'Certificate'
+$AuthType = 'Certificate'  # Valid values: 'ClientSecret' or 'Certificate'
+
+# Batch processing configuration to avoid timeouts
+$batchSize = 50  # Reduce batch size to avoid overwhelming the API
+$delayBetweenBatches = 5  # Seconds to wait between batches
+$maxConcurrentRequests = 5  # Limit concurrent requests
 
 # Client Secret authentication (used when $AuthType = 'ClientSecret')
 $clientSecret = '';
@@ -97,8 +103,12 @@ $date = Get-Date -Format "yyyyMMddHHmmss";
 # The log file will store the search results including sensitivity labels in CSV format
 $LogName = Join-Path -Path $env:TEMP -ChildPath ("SPOFileswithLabels_Search_Results_" + $date + ".csv");
 
+# Progress checkpoint file to allow resuming if the script is interrupted
+$ProgressFile = Join-Path -Path $env:TEMP -ChildPath ("SPOFileswithLabels_Progress_" + $date + ".json");
+
 # Initialize global variables for the token and search results
 $global:token = @();
+$global:tokenExpiry = $null;
 $global:Results = @();
 
 # Function to handle throttling for Microsoft Graph requests
@@ -125,10 +135,13 @@ function Invoke-GraphRequestWithThrottleHandling {
         [string]$ContentType = "application/json",
         
         [Parameter(Mandatory = $false)]
-        [int]$MaxRetries = 10,
+        [int]$MaxRetries = 15,  # Increased from 10
         
         [Parameter(Mandatory = $false)]
-        [int]$InitialBackoffSeconds = 2
+        [int]$InitialBackoffSeconds = 3,  # Increased from 2
+        
+        [Parameter(Mandatory = $false)]
+        [int]$TimeoutSeconds = 300  # 5 minute timeout
     )
     
     $retryCount = 0
@@ -142,36 +155,97 @@ function Invoke-GraphRequestWithThrottleHandling {
     
     while (-not $success -and $retryCount -lt $MaxRetries) {
         try {
+            # Create web request with timeout
             if ($Body) {
-                $result = Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -Body $Body -ContentType $ContentType -ErrorAction Stop
+                $result = Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -Body $Body -ContentType $ContentType -TimeoutSec $TimeoutSeconds -ErrorAction Stop
             }
             else {
-                $result = Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -ContentType $ContentType -ErrorAction Stop
+                $result = Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -ContentType $ContentType -TimeoutSec $TimeoutSeconds -ErrorAction Stop
             }
             $success = $true
         }
-        catch {
-            $statusCode = $_.Exception.Response.StatusCode.value__
+        catch [System.Net.WebException] {
+            $webException = $_.Exception
+            $statusCode = $null
             
-            # Check if this is a throttling error (429)
-            if ($statusCode -eq 429) {
+            # Handle different types of web exceptions
+            if ($webException.Response) {
+                $statusCode = [int]$webException.Response.StatusCode
+            }
+            
+            # Check for timeout or connection errors
+            if ($webException.Status -eq [System.Net.WebExceptionStatus]::Timeout -or 
+                $webException.Status -eq [System.Net.WebExceptionStatus]::ConnectionClosed -or
+                $webException.Status -eq [System.Net.WebExceptionStatus]::ConnectFailure -or
+                $statusCode -eq 502 -or $statusCode -eq 503 -or $statusCode -eq 504) {
+                
+                $retryCount++
+                $waitTime = [Math]::Min($backoffSeconds, 300)  # Cap at 5 minutes
+                
+                Write-Host "Connection/timeout error detected. Status: $($webException.Status). Waiting $waitTime seconds before retry. Attempt $retryCount of $MaxRetries..." -ForegroundColor Yellow
+                
+                if ($retryCount -lt $MaxRetries) {
+                    Start-Sleep -Seconds $waitTime
+                    $backoffSeconds = [Math]::Min($backoffSeconds * 2, 300)  # Exponential backoff capped at 5 minutes
+                }
+                else {
+                    Write-Host "Maximum retry attempts reached ($MaxRetries). Giving up." -ForegroundColor Red
+                    throw $_
+                }
+            }
+            elseif ($statusCode -eq 429) {
+                # Handle throttling
+                $retryAfter = $null
+                if ($webException.Response.Headers["Retry-After"]) {
+                    $retryAfter = [int]($webException.Response.Headers["Retry-After"])
+                    Write-Host "Request throttled. Retry-After header suggests waiting for $retryAfter seconds." -ForegroundColor Yellow
+                }
+                else {
+                    $retryAfter = $backoffSeconds
+                    Write-Host "Request throttled. Using exponential backoff: waiting for $retryAfter seconds." -ForegroundColor Yellow
+                    $backoffSeconds = [Math]::Min($backoffSeconds * 2, 300)
+                }
+                
+                $retryCount++
+                if ($retryCount -lt $MaxRetries) {
+                    Write-Host "Throttling detected. Waiting before retry. Attempt $retryCount of $MaxRetries..." -ForegroundColor Yellow
+                    Start-Sleep -Seconds $retryAfter
+                }
+                else {
+                    Write-Host "Maximum retry attempts reached ($MaxRetries). Giving up." -ForegroundColor Red
+                    throw $_
+                }
+            }
+            else {
+                # Not a recoverable error, rethrow
+                throw $_
+            }
+        }
+        catch {
+            $statusCode = $null
+            if ($_.Exception.Response) {
+                $statusCode = $_.Exception.Response.StatusCode.value__
+            }
+            
+            # Check if this is a throttling error (429) or server error (5xx)
+            if ($statusCode -eq 429 -or ($statusCode -ge 500 -and $statusCode -le 599)) {
                 # Get the Retry-After header if it exists
                 $retryAfter = $null
-                if ($_.Exception.Response.Headers.Contains("Retry-After")) {
+                if ($statusCode -eq 429 -and $_.Exception.Response.Headers.Contains("Retry-After")) {
                     $retryAfter = [int]($_.Exception.Response.Headers.GetValues("Retry-After") | Select-Object -First 1)
                     Write-Host "Request throttled. Retry-After header suggests waiting for $retryAfter seconds." -ForegroundColor Yellow
                 }
                 else {
                     # If no Retry-After header, use exponential backoff
                     $retryAfter = $backoffSeconds
-                    Write-Host "Request throttled. Using exponential backoff: waiting for $retryAfter seconds." -ForegroundColor Yellow
+                    Write-Host "Server error ($statusCode) or throttling detected. Using exponential backoff: waiting for $retryAfter seconds." -ForegroundColor Yellow
                     # Increase backoff for next potential retry (exponential)
-                    $backoffSeconds = $backoffSeconds * 2
+                    $backoffSeconds = [Math]::Min($backoffSeconds * 2, 300)  # Cap at 5 minutes
                 }
                 
                 $retryCount++
                 if ($retryCount -lt $MaxRetries) {
-                    Write-Host "Throttling detected. Waiting before retry. Attempt $retryCount of $MaxRetries..." -ForegroundColor Yellow
+                    Write-Host "Retryable error detected. Waiting before retry. Attempt $retryCount of $MaxRetries..." -ForegroundColor Yellow
                     Start-Sleep -Seconds $retryAfter
                 }
                 else {
@@ -210,7 +284,12 @@ function AcquireToken() {
             # Send the authentication request and extract the token
             $loginResponse = Invoke-RestMethod -Method Post -Uri $uri -Body $body -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop;
             $global:token = $loginResponse.access_token;
-            Write-Host "Successfully connected using Client Secret authentication" -ForegroundColor Green
+            
+            # Calculate token expiry (typically 1 hour, but we'll refresh before then)
+            $expiresIn = if ($loginResponse.expires_in) { $loginResponse.expires_in } else { 3600 }
+            $global:tokenExpiry = (Get-Date).AddSeconds($expiresIn - 300)  # Refresh 5 minutes before expiry
+            
+            Write-Host "Successfully connected using Client Secret authentication. Token expires at: $($global:tokenExpiry)" -ForegroundColor Green
         }
         catch {
             Write-Host "Failed to connect using Client Secret authentication" -ForegroundColor Red
@@ -282,7 +361,12 @@ function AcquireToken() {
             # Send the authentication request and extract the token
             $loginResponse = Invoke-RestMethod -Method Post -Uri $uri -Body $body -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop;
             $global:token = $loginResponse.access_token;
-            Write-Host "Successfully connected using Certificate authentication" -ForegroundColor Green
+            
+            # Calculate token expiry (typically 1 hour, but we'll refresh before then)
+            $expiresIn = if ($loginResponse.expires_in) { $loginResponse.expires_in } else { 3600 }
+            $global:tokenExpiry = (Get-Date).AddSeconds($expiresIn - 300)  # Refresh 5 minutes before expiry
+            
+            Write-Host "Successfully connected using Certificate authentication. Token expires at: $($global:tokenExpiry)" -ForegroundColor Green
         }
         catch {
             Write-Host "Failed to connect using Certificate authentication" -ForegroundColor Red
@@ -296,6 +380,14 @@ function AcquireToken() {
     }
 }
 
+# Function to check if token needs refresh and refresh if necessary
+function Ensure-ValidToken() {
+    if ($null -eq $global:tokenExpiry -or (Get-Date) -gt $global:tokenExpiry) {
+        Write-Host "Token expired or expiring soon. Refreshing..." -ForegroundColor Yellow
+        AcquireToken
+    }
+}
+
 
 # This function sends a search request to Microsoft Graph API and handles pagination
 function PerformSearch {
@@ -306,15 +398,21 @@ function PerformSearch {
     $headers = @{"Authorization" = "Bearer $global:token" };
     $string = "https://graph.microsoft.com/v1.0/search/query"; 
 
-    # Initialize variables for pagination
+    # Initialize variables for pagination - reduced batch size to avoid timeouts
     $moreresults = $true;
     $start = 0;
-    $size = 200;
+    $size = $batchSize;  # Use configurable batch size instead of hardcoded 200
     $i = 0;
+    $totalProcessed = 0;
 
     # Loop to handle pagination
     while ($moreresults) {
-        # The query searches for files of type 'agent' in the specified region
+        # Ensure we have a valid token before making the request
+        Ensure-ValidToken
+        
+        Write-Host -ForegroundColor Cyan "Processing batch $($i + 1), items $($start + 1) to $($start + $size)..."
+        
+        # The query searches for files of type specified in the configuration
         $requestPayload = @"
         {
             "requests": [
@@ -349,34 +447,75 @@ function PerformSearch {
             ]
         }
 "@;
-        # Invoke the REST method to perform the search query
-        $Results = Invoke-GraphRequestWithThrottleHandling -Uri $string -Method "POST" -Headers $headers -Body $requestPayload -ContentType "application/json";
-
-        Write-Host  $fileId 
-
-        # Export the search results to a CSV file
-        if ($null -ne $Results) {
-            # Add debug output to see the structure of results
-            if ($debug) {
-                Write-Host "Debug: Sample result structure:" -ForegroundColor Magenta
-                if ($Results.value.hitsContainers.hits.Count -gt 0) {
-                    $sampleResult = $Results.value.hitsContainers.hits[0].resource
-                    Write-Host "Sample resource properties: $($sampleResult.PSObject.Properties.Name -join ', ')" -ForegroundColor Magenta
+        # Invoke the REST method to perform the search query with enhanced error handling
+        try {
+            $Results = Invoke-GraphRequestWithThrottleHandling -Uri $string -Method "POST" -Headers $headers -Body $requestPayload -ContentType "application/json";
+            
+            # Export the search results to a CSV file
+            if ($null -ne $Results) {
+                # Add debug output to see the structure of results
+                if ($debug) {
+                    Write-Host "Debug: Sample result structure:" -ForegroundColor Magenta
+                    if ($Results.value.hitsContainers.hits.Count -gt 0) {
+                        $sampleResult = $Results.value.hitsContainers.hits[0].resource
+                        Write-Host "Sample resource properties: $($sampleResult.PSObject.Properties.Name -join ', ')" -ForegroundColor Magenta
+                    }
                 }
+                
+                $batchItemCount = $Results.value.hitsContainers.hits.Count
+                Write-Host -ForegroundColor Yellow "Processing $batchItemCount items in current batch..."
+                
+                # Process results in smaller chunks to avoid memory issues
+                ExportResultSet -results $Results;
+                
+                $totalProcessed += $batchItemCount
+                Write-Host -ForegroundColor Green "Total items processed so far: $totalProcessed"
+            }
+
+            # Check if more results are available
+            $moreresults = [boolean]::Parse($Results.value.hitsContainers.moreResultsAvailable);
+            $start = $start + $size;  # Removed the +1 which was causing gaps
+            $i++;
+            Write-Host -ForegroundColor Yellow "Completed batch: $i";
+            
+            # Add delay between batches to avoid overwhelming the API
+            if ($moreresults -and $delayBetweenBatches -gt 0) {
+                Write-Host -ForegroundColor Cyan "Waiting $delayBetweenBatches seconds before next batch to avoid rate limiting..."
+                Start-Sleep -Seconds $delayBetweenBatches
             }
             
-            ExportResultSet -results $Results;
+            # Save progress checkpoint
+            $progressData = @{
+                LastBatchCompleted = $i
+                LastStartPosition  = $start
+                TotalProcessed     = $totalProcessed
+                Timestamp          = (Get-Date).ToString()
+                BatchSize          = $size
+            }
+            $progressData | ConvertTo-Json | Set-Content -Path $ProgressFile
+            
+            Write-Host ""
         }
-
-        # Check if more results are available
-        $moreresults = [boolean]::Parse($Results.value.hitsContainers.moreResultsAvailable);
-        $start = $start + $size + 1;
-        $i++;
-        Write-Host -ForegroundColor Yellow "Result Batches: $i";
-        Write-Host ""
+        catch {
+            Write-Host -ForegroundColor Red "Error processing batch $($i + 1): $($_.Exception.Message)"
+            
+            # Determine if we should retry or stop
+            if ($_.Exception.Message -like "*timeout*" -or $_.Exception.Message -like "*gateway*" -or $_.Exception.Message -like "*502*" -or $_.Exception.Message -like "*503*" -or $_.Exception.Message -like "*504*") {
+                Write-Host -ForegroundColor Yellow "Network/timeout error detected. Waiting 30 seconds before continuing..."
+                Start-Sleep -Seconds 30
+                
+                # Don't increment the batch counter, so we retry the same batch
+                continue
+            }
+            else {
+                # Non-recoverable error, rethrow
+                throw $_
+            }
+        }
     }
 
     Write-Host -ForegroundColor Green "Search Completed Successfully";
+    Write-Host -ForegroundColor Green "Total items processed: $totalProcessed"
     Write-Host ""
     Write-Host -ForegroundColor Yellow "Results Exported to $logName";
 }
@@ -642,52 +781,103 @@ function ProcessFileForSensitivityLabel($fileInfo, $userDrive, $resourceId, $hea
 
 # This function extracts relevant fields from the search results and appends them to the CSV file
 function ExportResultSet($results) {
-    $Results.value.hitsContainers.hits.resource | ForEach-Object {
-        if ($debug) {
-            Write-Host "Attempting to extract sensitivity labels using Graph API for file: $($_.name)" -ForegroundColor Cyan
-        }
-        else {
-            Write-Host "Processing file: $($_.webUrl)" -ForegroundColor Cyan
-        }
+    $items = $Results.value.hitsContainers.hits.resource
+    $itemCount = $items.Count
+    $processedCount = 0
+    
+    Write-Host -ForegroundColor Cyan "Processing $itemCount items for sensitivity labels..."
+    
+    # Process items in smaller batches to avoid overwhelming the API
+    $processingBatchSize = [Math]::Min($maxConcurrentRequests, $itemCount)
+    
+    for ($i = 0; $i -lt $itemCount; $i += $processingBatchSize) {
+        $endIndex = [Math]::Min($i + $processingBatchSize - 1, $itemCount - 1)
+        $batch = $items[$i..$endIndex]
         
-        # Debug: Show the resource ID if available
-        if ($debug -and $_.PSObject.Properties.Name -contains 'id') {
-            Write-Host "  Resource ID: $($_.id)" -ForegroundColor Gray
-        }
+        Write-Host -ForegroundColor Gray "Processing items $($i + 1) to $($endIndex + 1) of $itemCount..."
         
-        # Extract relative path from webUrl and try to get sensitivity label via extractSensitivityLabels API
-        if ($null -ne $_.webUrl) {
+        # Process batch items
+        foreach ($item in $batch) {
             try {
-                $uri = [System.Uri]$_.webUrl
-                # Decode the URL
-                $relativePath = [System.Web.HttpUtility]::UrlDecode($uri.AbsolutePath)
-                
                 if ($debug) {
-                    Write-Host "  File path: $relativePath" -ForegroundColor Gray
+                    Write-Host "Attempting to extract sensitivity labels using Graph API for file: $($item.name)" -ForegroundColor Cyan
+                }
+                else {
+                    Write-Host "Processing file: $($item.webUrl)" -ForegroundColor Cyan
                 }
                 
-                # Try to get the file using extractSensitivityLabels API
-                # Pass the resource ID and webUrl if available
-                $resourceId = if ($_.PSObject.Properties.Name -contains 'id') { $_.id } else { $null }
-                $sensitivityLabel = GetSensitivityLabelViaExtractAPI -relativePath $relativePath -fileName $_.name -resourceId $resourceId -webUrl $_.webUrl
+                # Debug: Show the resource ID if available
+                if ($debug -and $item.PSObject.Properties.Name -contains 'id') {
+                    Write-Host "  Resource ID: $($item.id)" -ForegroundColor Gray
+                }
+                
+                # Extract relative path from webUrl and try to get sensitivity label via extractSensitivityLabels API
+                $sensitivityLabel = "No Label"  # Default value
+                
+                if ($null -ne $item.webUrl) {
+                    try {
+                        $uri = [System.Uri]$item.webUrl
+                        # Decode the URL
+                        $relativePath = [System.Web.HttpUtility]::UrlDecode($uri.AbsolutePath)
+                        
+                        if ($debug) {
+                            Write-Host "  File path: $relativePath" -ForegroundColor Gray
+                        }
+                        
+                        # Try to get the file using extractSensitivityLabels API
+                        # Pass the resource ID and webUrl if available
+                        $resourceId = if ($item.PSObject.Properties.Name -contains 'id') { $item.id } else { $null }
+                        $sensitivityLabel = GetSensitivityLabelViaExtractAPI -relativePath $relativePath -fileName $item.name -resourceId $resourceId -webUrl $item.webUrl
+                    }
+                    catch {
+                        Write-Warning "Could not parse webUrl for file: $($item.name). Error: $($_.Exception.Message)"
+                        $sensitivityLabel = "URL parsing failed"
+                    }
+                }
+                else {
+                    Write-Warning "No webUrl available for file: $($item.name)"
+                    $sensitivityLabel = "No URL available"
+                }
+                
+                # Export individual item to CSV
+                $item | Select-Object ID, Name, WebURL, 
+                @{Name = "CreatedDate"; Expression = { $_.createdDateTime } },
+                @{Name = "LastAccessedDate"; Expression = { $_.lastModifiedDateTime } },
+                @{Name = "Owner"; Expression = { $_.createdBy.user.displayName } },
+                @{Name = "SensitivityLabel"; Expression = { $sensitivityLabel } } | 
+                Export-Csv $logName -NoTypeInformation -NoClobber -Append;
+                
+                $processedCount++
+                
+                # Add small delay between individual items to avoid overwhelming the API
+                if (($processedCount % 10) -eq 0) {
+                    Write-Host -ForegroundColor Green "Processed $processedCount of $itemCount items..."
+                    Start-Sleep -Milliseconds 500  # Small delay every 10 items
+                }
             }
             catch {
-                Write-Warning "Could not parse webUrl for file: $($_.name). Error: $($_.Exception.Message)"
-                $sensitivityLabel = "URL parsing failed"
+                Write-Warning "Error processing file $($item.name): $($_.Exception.Message)"
+                
+                # Still export the item with error info
+                $item | Select-Object ID, Name, WebURL, 
+                @{Name = "CreatedDate"; Expression = { $_.createdDateTime } },
+                @{Name = "LastAccessedDate"; Expression = { $_.lastModifiedDateTime } },
+                @{Name = "Owner"; Expression = { $_.createdBy.user.displayName } },
+                @{Name = "SensitivityLabel"; Expression = { "Error: $($_.Exception.Message)" } } | 
+                Export-Csv $logName -NoTypeInformation -NoClobber -Append;
+                
+                $processedCount++
             }
         }
-        else {
-            Write-Warning "No webUrl available for file: $($_.name)"
-            $sensitivityLabel = "No URL available"
-        }
         
-        $_ | Select-Object ID, Name, WebURL, 
-        @{Name = "CreatedDate"; Expression = { $_.createdDateTime } },
-        @{Name = "LastAccessedDate"; Expression = { $_.lastModifiedDateTime } },
-        @{Name = "Owner"; Expression = { $_.createdBy.user.displayName } },
-        @{Name = "SensitivityLabel"; Expression = { $sensitivityLabel } } | 
-        Export-Csv $logName -NoTypeInformation -NoClobber -Append;
+        # Add delay between processing batches
+        if ($endIndex -lt ($itemCount - 1)) {
+            Write-Host -ForegroundColor Yellow "Waiting 2 seconds before processing next batch..."
+            Start-Sleep -Seconds 2
+        }
     }
+    
+    Write-Host -ForegroundColor Green "Completed processing $processedCount items in this result set."
 }
 
 # This is the first step before performing any search queries
