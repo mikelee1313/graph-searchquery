@@ -69,6 +69,10 @@ Update the variables at the top of the script to match your environment:
   - Retention label
   - Other metadata as available
 
+Output Example:
+
+<img width="1839" height="119" alt="image" src="https://github.com/user-attachments/assets/4d57e2c1-a174-4735-b833-5dab87e06769" />
+
 ## Advanced Info
 
 - Handles throttling and server errors using exponential backoff and retry logic
