@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-Searches for PDF files in OneDrive and extracts their sensitivity labels using Microsoft Graph API.
+Searches for PDF files in OneDrive and extracts their sensitivity labels and retention labels using Microsoft Graph API.
 
 .DESCRIPTION
 This script authenticates with Microsoft Graph API, performs a search for specific files in OneDrive,
-and extracts detailed information including sensitivity labels. The results are exported to a CSV file.
+and extracts detailed information including sensitivity labels and retention labels. The results are exported to a CSV file.
 
 .PARAMETER None
 This script does not accept parameters through the command line. Configuration is done through variables
@@ -14,7 +14,7 @@ at the beginning of the script.
 File Name       : Get-SPOFileswithLabels.ps1
 Author          : Mike Lee
 Date Created    : 7/18/25
-Date Updated    : 7/22/25
+Date Updated    : 7/30/25
 Prerequisites   : 
 - PowerShell 5.1 or higher
 - Appropriate permissions in Azure AD 
@@ -23,6 +23,7 @@ API Permissions Required:
 - Sites.Read.All (for both OneDrive and SharePoint sites)
 - Files.Read.All (for file access)
 - InformationProtectionPolicy.Read.All (for sensitivity labels)
+- RecordsManagement.Read.All (for retention labels)
 
 - Microsoft Graph API access
 
@@ -31,7 +32,7 @@ PS> .\Get-SPOFileswithLabels.ps1
 Performs the search and exports results to a CSV file in the %TEMP% directory.
 
 .OUTPUTS
-CSV file with search results including file details and sensitivity labels.
+CSV file with search results including file details, sensitivity labels, and retention labels.
 
 .LINK
 https://learn.microsoft.com/en-us/graph/api/resources/search-api-overview
@@ -45,7 +46,7 @@ Microsoft Graph API
 - Performs search queries for specific files in OneDrive
 - Handles pagination for large result sets
 - Handles throttling using exponential backoff
-- Extracts sensitivity labels and other file metadata
+- Extracts sensitivity labels and retention labels along with other file metadata
 - Exports results to a CSV file
 #>
 
@@ -60,7 +61,7 @@ $tenantName = "m365cpi13246019-my"
 
 # Set the file type to search for (without the dot)
 # Common types: docx, pdf, xlsx, pptx, txt
-$fileType = "docx"
+$fileType = "xlsx"
 
 # Enable or disable verbose debug output
 # Set to $true for detailed logging, $false for basic info only
@@ -100,7 +101,7 @@ Add-Type -AssemblyName System.Web
 # This ensures each log file has a unique name
 $date = Get-Date -Format "yyyyMMddHHmmss";
 
-# The log file will store the search results including sensitivity labels in CSV format
+# The log file will store the search results including sensitivity and retention labels in CSV format
 $LogName = Join-Path -Path $env:TEMP -ChildPath ("SPOFileswithLabels_Search_Results_" + $date + ".csv");
 
 # Initialize global variables for the token and search results
@@ -378,10 +379,170 @@ function AcquireToken() {
 }
 
 # Function to check if token needs refresh and refresh if necessary
-function Ensure-ValidToken() {
+function Test-ValidToken() {
     if ($null -eq $global:tokenExpiry -or (Get-Date) -gt $global:tokenExpiry) {
         Write-Host "Token expired or expiring soon. Refreshing..." -ForegroundColor Yellow
         AcquireToken
+    }
+}
+
+# Global variable to cache sensitivity labels to avoid repeated API calls
+$global:sensitivityLabelsCache = @{}
+
+# Function to preload all sensitivity labels into cache
+function Initialize-SensitivityLabelsCache() {
+    Write-Host "Initializing sensitivity labels cache..." -ForegroundColor Cyan
+    
+    try {
+        # Ensure we have a valid token
+        Test-ValidToken
+        
+        $headers = @{"Authorization" = "Bearer $global:token" }
+        
+        # Use the beta endpoint that works
+        $uri = "https://graph.microsoft.com/beta/security/informationProtection/sensitivityLabels"
+        
+        if ($debug) {
+            Write-Host "  Fetching all sensitivity labels from: $uri" -ForegroundColor Gray
+        }
+        
+        $response = Invoke-GraphRequestWithThrottleHandling -Uri $uri -Method "GET" -Headers $headers -ContentType "application/json"
+        
+        if ($response -and $response.value -and $response.value.Count -gt 0) {
+            # Build the cache hash table with ID as key and name as value
+            foreach ($label in $response.value) {
+                if ($label.id -and $label.name) {
+                    $global:sensitivityLabelsCache[$label.id] = $label.name
+                    if ($debug) {
+                        Write-Host "  Cached label: $($label.name) (ID: $($label.id))" -ForegroundColor Gray
+                    }
+                }
+            }
+            
+            Write-Host "✓ Successfully cached $($global:sensitivityLabelsCache.Count) sensitivity labels" -ForegroundColor Green
+            
+            if ($debug) {
+                Write-Host "  Cached labels: $($global:sensitivityLabelsCache.Values -join ', ')" -ForegroundColor Gray
+            }
+        }
+        else {
+            Write-Host "⚠ No sensitivity labels found or response was empty" -ForegroundColor Yellow
+            
+            # Try fallback endpoints if the beta endpoint doesn't return results
+            try {
+                Write-Host "  Trying v1.0 security endpoint..." -ForegroundColor Yellow
+                $fallbackUri = "https://graph.microsoft.com/v1.0/security/informationProtection/sensitivityLabels"
+                
+                $fallbackResponse = Invoke-GraphRequestWithThrottleHandling -Uri $fallbackUri -Method "GET" -Headers $headers -ContentType "application/json"
+                
+                if ($fallbackResponse -and $fallbackResponse.value -and $fallbackResponse.value.Count -gt 0) {
+                    foreach ($label in $fallbackResponse.value) {
+                        if ($label.id -and $label.name) {
+                            $global:sensitivityLabelsCache[$label.id] = $label.name
+                        }
+                    }
+                    Write-Host "✓ Successfully cached $($global:sensitivityLabelsCache.Count) sensitivity labels via v1.0 endpoint" -ForegroundColor Green
+                }
+            }
+            catch {
+                Write-Host "  v1.0 security endpoint also failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+    }
+    catch {
+        $statusCode = $null
+        if ($_.Exception.Response) {
+            $statusCode = $_.Exception.Response.StatusCode.value__
+        }
+        
+        Write-Host "❌ Failed to initialize sensitivity labels cache" -ForegroundColor Red
+        Write-Host "   Status Code: $statusCode" -ForegroundColor Yellow
+        Write-Host "   Error: $($_.Exception.Message)" -ForegroundColor Yellow
+        
+        if ($debug) {
+            Write-Host "   Full error details: $($_.Exception)" -ForegroundColor Gray
+        }
+        
+        # Don't exit - we'll fall back to individual lookups if needed
+        Write-Host "ℹ Will fall back to individual label lookups when needed" -ForegroundColor Cyan
+    }
+}
+
+# Function to get sensitivity label display name from label ID
+function Get-SensitivityLabelDisplayName($labelId) {
+    try {
+        # Check cache first - this should now contain all labels from initialization
+        if ($global:sensitivityLabelsCache.ContainsKey($labelId)) {
+            if ($debug) {
+                Write-Host "  ✓ Using cached sensitivity label: $($global:sensitivityLabelsCache[$labelId])" -ForegroundColor Gray
+            }
+            return $global:sensitivityLabelsCache[$labelId]
+        }
+        
+        # If not in cache, this might be a new label or cache initialization failed
+        Write-Host "  ⚠ Label ID $labelId not found in cache, attempting individual lookup..." -ForegroundColor Yellow
+        
+        # Ensure we have a valid token
+        Test-ValidToken
+        
+        $headers = @{"Authorization" = "Bearer $global:token" }
+        
+        # Use the beta endpoint that works
+        $uri = "https://graph.microsoft.com/beta/security/informationProtection/sensitivityLabels"
+        
+        if ($debug) {
+            Write-Host "  Calling Security Information Protection API: $uri" -ForegroundColor Gray
+        }
+        
+        $policyResponse = Invoke-GraphRequestWithThrottleHandling -Uri $uri -Method "GET" -Headers $headers -ContentType "application/json"
+        
+        if ($policyResponse -and $policyResponse.value) {
+            # Search for the label by ID
+            $matchingLabel = $policyResponse.value | Where-Object { $_.id -eq $labelId }
+            
+            if ($matchingLabel -and $matchingLabel.name) {
+                # Cache the result for future use
+                $global:sensitivityLabelsCache[$labelId] = $matchingLabel.name
+                
+                Write-Host "  ✓ Retrieved and cached sensitivity label name: $($matchingLabel.name)" -ForegroundColor Green
+                
+                return $matchingLabel.name
+            }
+            else {
+                Write-Host "  ⚠ Label ID $labelId not found in sensitivity labels" -ForegroundColor Yellow
+                if ($debug) {
+                    Write-Host "  Available label IDs: $($policyResponse.value.id -join ', ')" -ForegroundColor Gray
+                }
+                return "Label ID: $labelId"
+            }
+        }
+        else {
+            Write-Host "  ⚠ No sensitivity labels returned from API" -ForegroundColor Yellow
+            return "Label ID: $labelId"
+        }
+    }
+    catch {
+        $statusCode = $null
+        if ($_.Exception.Response) {
+            $statusCode = $_.Exception.Response.StatusCode.value__
+        }
+        
+        Write-Host "  ❌ Failed to get sensitivity label display name for ID: $labelId" -ForegroundColor Red
+        Write-Host "     Status Code: $statusCode" -ForegroundColor Yellow
+        Write-Host "     Error: $($_.Exception.Message)" -ForegroundColor Yellow
+        
+        if ($debug) {
+            Write-Host "     Full error details: $($_.Exception)" -ForegroundColor Gray
+        }
+        
+        # As a last resort, let's create a simplified display name
+        # This is better than showing the full GUID
+        $shortId = $labelId.Substring(0, 8)
+        $friendlyName = "Sensitivity Label ($shortId)"
+        
+        Write-Host "  ℹ Using fallback display name: $friendlyName" -ForegroundColor Cyan
+        
+        return $friendlyName
     }
 }
 
@@ -405,7 +566,7 @@ function PerformSearch {
     # Loop to handle pagination
     while ($moreresults) {
         # Ensure we have a valid token before making the request
-        Ensure-ValidToken
+        Test-ValidToken
         
         Write-Host -ForegroundColor Cyan "Processing batch $($i + 1), items $($start + 1) to $($start + $size)..."
         
@@ -534,6 +695,56 @@ function GetFileSensitivityLabel($fileId, $driveId) {
     catch {
         Write-Warning "Failed to retrieve sensitivity label for file ID: $fileId. Error: $($_.Exception.Message)"
         return "Error retrieving label"
+    }
+}
+
+# This function retrieves retention label information for a file
+function GetFileRetentionLabel($driveId, $fileId) {
+    try {
+        # Check if parameters are null
+        if ($null -eq $fileId -or $null -eq $driveId) {
+            Write-Warning "FileId or DriveId is null. FileId: $fileId, DriveId: $driveId"
+            return "Missing IDs"
+        }
+        
+        $headers = @{"Authorization" = "Bearer $global:token" };
+        $uri = "https://graph.microsoft.com/v1.0/drives/$driveId/items/$fileId/retentionLabel"
+        
+        if ($debug) {
+            Write-Host "Calling Retention Label API: $uri" -ForegroundColor Gray
+        }
+        
+        $retentionDetails = Invoke-GraphRequestWithThrottleHandling -Uri $uri -Method "GET" -Headers $headers -ContentType "application/json"
+        
+        # Extract retention label information
+        $retentionLabel = "No Label"
+        if ($null -ne $retentionDetails -and $retentionDetails.PSObject.Properties.Name -contains 'name' -and $null -ne $retentionDetails.name) {
+            $retentionLabel = $retentionDetails.name
+            Write-Host "  Found retention label: $retentionLabel" -ForegroundColor Green
+            if ($debug) {
+                Write-Host "  Retention label details: $($retentionDetails | ConvertTo-Json -Depth 2)" -ForegroundColor Magenta
+            }
+        }
+        
+        return $retentionLabel
+    }
+    catch {
+        $statusCode = $null
+        if ($_.Exception.Response) {
+            $statusCode = $_.Exception.Response.StatusCode.value__
+        }
+        
+        # Handle 404 specifically as "No Label" since it means no retention label is applied
+        if ($statusCode -eq 404) {
+            if ($debug) {
+                Write-Host "  No retention label found (404 - expected for files without retention labels)" -ForegroundColor Gray
+            }
+            return "No Label"
+        }
+        else {
+            Write-Host "Failed to retrieve retention label for file ID: $fileId. Status: $statusCode, Error: $($_.Exception.Message)" -ForegroundColor Red
+            return "Error retrieving label"
+        }
     }
 }
 
@@ -707,11 +918,18 @@ function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId 
             }
         }
         
-        return "No Label"
+        # Return default structure if nothing was found
+        return @{
+            SensitivityLabel = "No Label"
+            RetentionLabel   = "No Label"
+        }
     }
     catch {
         Write-Warning "GetSensitivityLabelViaExtractAPI failed for file: $fileName. Error: $($_.Exception.Message)"
-        return "API access failed"
+        return @{
+            SensitivityLabel = "API access failed"
+            RetentionLabel   = "API access failed"
+        }
     }
 }
 
@@ -721,48 +939,88 @@ function ProcessFileForSensitivityLabel($fileInfo, $userDrive, $resourceId, $hea
         Write-Host "  File properties available: $($fileInfo.PSObject.Properties.Name -join ', ')" -ForegroundColor Gray
     }
     
+    $sensitivityLabel = "No Label"
+    $retentionLabel = "No Label"
+    
     # Look for sensitivity label in file properties
     if ($fileInfo.PSObject.Properties.Name -contains 'sensitivityLabel' -and $null -ne $fileInfo.sensitivityLabel) {
         $sensitivityLabel = $fileInfo.sensitivityLabel.displayName
         Write-Host "  Found sensitivity label in file properties: $sensitivityLabel" -ForegroundColor Green
-        return $sensitivityLabel
     }
     elseif ($fileInfo.PSObject.Properties.Name -contains 'classification' -and $null -ne $fileInfo.classification) {
         $sensitivityLabel = $fileInfo.classification
         Write-Host "  Found classification in file properties: $sensitivityLabel" -ForegroundColor Green
-        return $sensitivityLabel
+    }
+    else {
+        # Try extractSensitivityLabels with the drive
+        try {
+            $extractUri = "https://graph.microsoft.com/v1.0/drives/$($userDrive.id)/items/$resourceId/extractSensitivityLabels"
+            if ($debug) {
+                Write-Host "  Trying extractSensitivityLabels: $extractUri" -ForegroundColor Gray
+            }
+            
+            $extractResult = Invoke-GraphRequestWithThrottleHandling -Uri $extractUri -Method "POST" -Headers $headers -ContentType "application/json"
+            
+            # Check response structure
+            if ($extractResult -and $extractResult.labels -and $extractResult.labels.Count -gt 0) {
+                $sensitivityLabelId = $extractResult.labels[0].sensitivityLabelId
+                $assignmentMethod = $extractResult.labels[0].assignmentMethod
+                
+                # Get the display name for the sensitivity label
+                $sensitivityLabelDisplayName = Get-SensitivityLabelDisplayName -labelId $sensitivityLabelId
+                
+                # Check if we got a proper display name or if it fell back to showing the Label ID
+                if ($sensitivityLabelDisplayName -like "Label ID:*") {
+                    # If we couldn't get the display name, show the full Label ID info
+                    $sensitivityLabel = $sensitivityLabelDisplayName + " ($assignmentMethod)"
+                }
+                else {
+                    # We got a proper display name
+                    $sensitivityLabel = "$sensitivityLabelDisplayName ($assignmentMethod)"
+                }
+                
+                Write-Host "  Found sensitivity label via extractSensitivityLabels: $sensitivityLabel" -ForegroundColor Green
+                
+                # Add debug info about the API call
+                if ($debug) {
+                    Write-Host "  Label ID: $sensitivityLabelId, Display Name: $sensitivityLabelDisplayName" -ForegroundColor Gray
+                }
+            }
+            else {
+                if ($debug) {
+                    Write-Host "  extractSensitivityLabels returned no labels - file has no sensitivity label applied" -ForegroundColor Yellow
+                }
+                $sensitivityLabel = "No Label"
+            }
+        }
+        catch {
+            $statusCode = $_.Exception.Response.StatusCode.value__ 
+            if ($debug) {
+                Write-Host "  extractSensitivityLabels failed: $statusCode - $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+            $sensitivityLabel = "No Label"
+        }
     }
     
-    # Try extractSensitivityLabels with the drive
+    # Get retention label using the new function
     try {
-        $extractUri = "https://graph.microsoft.com/v1.0/drives/$($userDrive.id)/items/$resourceId/extractSensitivityLabels"
-        if ($debug) {
-            Write-Host "  Trying extractSensitivityLabels: $extractUri" -ForegroundColor Gray
-        }
-        
-        $extractResult = Invoke-GraphRequestWithThrottleHandling -Uri $extractUri -Method "POST" -Headers $headers -ContentType "application/json"
-        
-        # Check response structure
-        if ($extractResult -and $extractResult.labels -and $extractResult.labels.Count -gt 0) {
-            $sensitivityLabelId = $extractResult.labels[0].sensitivityLabelId
-            $assignmentMethod = $extractResult.labels[0].assignmentMethod
-            $sensitivityLabel = "Label ID: $sensitivityLabelId ($assignmentMethod)"
-            Write-Host "  Found sensitivity label via extractSensitivityLabels: $sensitivityLabel" -ForegroundColor Green
-            return $sensitivityLabel
-        }
-        else {
-            if ($debug) {
-                Write-Host "  extractSensitivityLabels returned no labels - file has no sensitivity label applied" -ForegroundColor Yellow
-            }
-            return "No Label"
+        $retentionLabel = GetFileRetentionLabel -driveId $userDrive.id -fileId $resourceId
+        if ($retentionLabel -ne "No Label" -and $retentionLabel -ne "Error retrieving label") {
+            Write-Host "  Successfully retrieved retention label: $retentionLabel" -ForegroundColor Green
         }
     }
     catch {
-        $statusCode = $_.Exception.Response.StatusCode.value__ 
+        Write-Host "  Failed to get retention label: $($_.Exception.Message)" -ForegroundColor Red
         if ($debug) {
-            Write-Host "  extractSensitivityLabels failed: $statusCode - $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "  Retention label error details: $($_.Exception)" -ForegroundColor Yellow
         }
-        return "No Label"
+        $retentionLabel = "Error retrieving label"
+    }
+    
+    # Return both labels as a hashtable
+    return @{
+        SensitivityLabel = $sensitivityLabel
+        RetentionLabel   = $retentionLabel
     }
 }
 
@@ -772,7 +1030,7 @@ function ExportResultSet($results) {
     $itemCount = $items.Count
     $processedCount = 0
     
-    Write-Host -ForegroundColor Cyan "Processing $itemCount items for sensitivity labels..."
+    Write-Host -ForegroundColor Cyan "Processing $itemCount items for sensitivity and retention labels..."
     
     # Process items in smaller batches to avoid overwhelming the API
     $processingBatchSize = [Math]::Min($maxConcurrentRequests, $itemCount)
@@ -787,7 +1045,7 @@ function ExportResultSet($results) {
         foreach ($item in $batch) {
             try {
                 if ($debug) {
-                    Write-Host "Attempting to extract sensitivity labels using Graph API for file: $($item.name)" -ForegroundColor Cyan
+                    Write-Host "Attempting to extract sensitivity and retention labels using Graph API for file: $($item.name)" -ForegroundColor Cyan
                 }
                 else {
                     Write-Host "Processing file: $($item.webUrl)" -ForegroundColor Cyan
@@ -798,8 +1056,9 @@ function ExportResultSet($results) {
                     Write-Host "  Resource ID: $($item.id)" -ForegroundColor Gray
                 }
                 
-                # Extract relative path from webUrl and try to get sensitivity label via extractSensitivityLabels API
+                # Extract relative path from webUrl and try to get both sensitivity and retention labels
                 $sensitivityLabel = "No Label"  # Default value
+                $retentionLabel = "No Label"    # Default value
                 
                 if ($null -ne $item.webUrl) {
                     try {
@@ -811,28 +1070,50 @@ function ExportResultSet($results) {
                             Write-Host "  File path: $relativePath" -ForegroundColor Gray
                         }
                         
-                        # Try to get the file using extractSensitivityLabels API
+                        # Try to get the file using extractSensitivityLabels API and retention labels
                         # Pass the resource ID and webUrl if available
                         $resourceId = if ($item.PSObject.Properties.Name -contains 'id') { $item.id } else { $null }
-                        $sensitivityLabel = GetSensitivityLabelViaExtractAPI -relativePath $relativePath -fileName $item.name -resourceId $resourceId -webUrl $item.webUrl
+                        $labelResults = GetSensitivityLabelViaExtractAPI -relativePath $relativePath -fileName $item.name -resourceId $resourceId -webUrl $item.webUrl
+                        
+                        # Handle both old string return and new hashtable return for backward compatibility
+                        if ($labelResults -is [hashtable]) {
+                            $sensitivityLabel = $labelResults.SensitivityLabel
+                            $retentionLabel = $labelResults.RetentionLabel
+                        }
+                        else {
+                            # Backward compatibility - treat as sensitivity label only
+                            $sensitivityLabel = $labelResults
+                            $retentionLabel = "No Label"
+                        }
                     }
                     catch {
                         Write-Warning "Could not parse webUrl for file: $($item.name). Error: $($_.Exception.Message)"
                         $sensitivityLabel = "URL parsing failed"
+                        $retentionLabel = "URL parsing failed"
                     }
                 }
                 else {
                     Write-Warning "No webUrl available for file: $($item.name)"
                     $sensitivityLabel = "No URL available"
+                    $retentionLabel = "No URL available"
                 }
                 
-                # Export individual item to CSV
+                # Export individual item to CSV with both sensitivity and retention labels
                 $item | Select-Object ID, Name, WebURL, 
                 @{Name = "CreatedDate"; Expression = { $_.createdDateTime } },
                 @{Name = "LastAccessedDate"; Expression = { $_.lastModifiedDateTime } },
                 @{Name = "Owner"; Expression = { $_.createdBy.user.displayName } },
-                @{Name = "SensitivityLabel"; Expression = { $sensitivityLabel } } | 
+                @{Name = "SensitivityLabel"; Expression = { $sensitivityLabel } },
+                @{Name = "RetentionLabel"; Expression = { $retentionLabel } } | 
                 Export-Csv $logName -NoTypeInformation -NoClobber -Append;
+                
+                # Log the labels found to console
+                if ($sensitivityLabel -ne "No Label" -and $sensitivityLabel -notlike "*failed*" -and $sensitivityLabel -notlike "*Error*") {
+                    Write-Host "    ✓ Sensitivity Label: $sensitivityLabel" -ForegroundColor Green
+                }
+                if ($retentionLabel -ne "No Label" -and $retentionLabel -notlike "*failed*" -and $retentionLabel -notlike "*Error*") {
+                    Write-Host "    ✓ Retention Label: $retentionLabel" -ForegroundColor Green
+                }
                 
                 $processedCount++
                 
@@ -850,7 +1131,8 @@ function ExportResultSet($results) {
                 @{Name = "CreatedDate"; Expression = { $_.createdDateTime } },
                 @{Name = "LastAccessedDate"; Expression = { $_.lastModifiedDateTime } },
                 @{Name = "Owner"; Expression = { $_.createdBy.user.displayName } },
-                @{Name = "SensitivityLabel"; Expression = { "Error: $($_.Exception.Message)" } } | 
+                @{Name = "SensitivityLabel"; Expression = { "Error: $($_.Exception.Message)" } },
+                @{Name = "RetentionLabel"; Expression = { "Error: $($_.Exception.Message)" } } | 
                 Export-Csv $logName -NoTypeInformation -NoClobber -Append;
                 
                 $processedCount++
@@ -869,6 +1151,9 @@ function ExportResultSet($results) {
 
 # This is the first step before performing any search queries
 AcquireToken;
+
+# Initialize the sensitivity labels cache to reduce API calls during processing
+Initialize-SensitivityLabelsCache;
 
 # Perform search for each query
 PerformSearch 
