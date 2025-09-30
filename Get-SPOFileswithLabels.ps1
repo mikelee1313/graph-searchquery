@@ -14,7 +14,7 @@ at the beginning of the script.
 File Name       : Get-SPOFileswithLabels.ps1
 Author          : Mike Lee
 Date Created    : 7/18/25
-Date Updated    : 7/30/25
+Date Updated    : 9/30/25
 Prerequisites   : 
 - PowerShell 5.1 or higher
 - Appropriate permissions in Azure AD 
@@ -57,7 +57,7 @@ Microsoft Graph API
 
 # Set your tenant name (the part before .sharepoint.com)
 # Example: if your SharePoint URL is https://contoso.sharepoint.com, enter "contoso"
-$tenantName = "m365cpi13246019-my"
+$tenantName = "m365cpi13246019"
 
 # Set the file type to search for (without the dot)
 # Common types: docx, pdf, xlsx, pptx, txt
@@ -874,7 +874,7 @@ function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId 
                         }
                         
                         # Get the site ID using the site URL 
-                        $siteInfoUri = "https://graph.microsoft.com/v1.0/sites/$($uri.Host):$($uri.AbsolutePath.Split('/')[1])/$($uri.AbsolutePath.Split('/')[2])"
+                      $siteInfoUri = "https://graph.microsoft.com/v1.0/sites/$($uri.Host):$($uri.AbsolutePath.Split('/')[1])/$($uri.AbsolutePath.Split('/')[2])"
                         
                         # Alternative approach: use the hostname and path
                         $siteInfoUri = "https://graph.microsoft.com/v1.0/sites/$($uri.Host):/sites/$siteIdentifier"
@@ -899,12 +899,38 @@ function GetSensitivityLabelViaExtractAPI($relativePath, $fileName, $resourceId 
                                 $fileInfoUri = "https://graph.microsoft.com/v1.0/drives/$($siteDrive.id)/items/$resourceId"
                                 if ($debug) {
                                     Write-Host "  Getting file properties: $fileInfoUri" -ForegroundColor Gray
+                                    Write-Host "  Site Drive ID: $($siteDrive.id)" -ForegroundColor Gray
+                                    Write-Host "  Resource ID: $resourceId" -ForegroundColor Gray
                                 }
                                 
-                                $fileInfo = Invoke-GraphRequestWithThrottleHandling -Uri $fileInfoUri -Method "GET" -Headers $headers -ContentType "application/json"
-                                
-                                if ($fileInfo) {
-                                    return ProcessFileForSensitivityLabel -fileInfo $fileInfo -userDrive $siteDrive -resourceId $resourceId -headers $headers
+                                try {
+                                    $fileInfo = Invoke-GraphRequestWithThrottleHandling -Uri $fileInfoUri -Method "GET" -Headers $headers -ContentType "application/json"
+                                    
+                                    if ($fileInfo) {
+                                        Write-Host "  ✓ Successfully retrieved file info for SharePoint file" -ForegroundColor Green
+                                        return ProcessFileForSensitivityLabel -fileInfo $fileInfo -userDrive $siteDrive -resourceId $resourceId -headers $headers
+                                    }
+                                    else {
+                                        Write-Host "  ⚠ File info call succeeded but returned null/empty result" -ForegroundColor Yellow
+                                        # Still try to process with what we have - pass the siteDrive as userDrive
+                                        Write-Host "  ℹ Attempting to process with available drive information..." -ForegroundColor Cyan
+                                        return ProcessFileForSensitivityLabel -fileInfo @{} -userDrive $siteDrive -resourceId $resourceId -headers $headers
+                                    }
+                                }
+                                catch {
+                                    Write-Host "  ❌ Failed to get file info: $($_.Exception.Message)" -ForegroundColor Red
+                                    if ($debug) {
+                                        Write-Host "  Full error: $($_.Exception)" -ForegroundColor Gray
+                                    }
+                                    # Try alternative approach: process with minimal file info but valid drive
+                                    Write-Host "  ℹ Attempting fallback processing with drive information..." -ForegroundColor Cyan
+                                    return ProcessFileForSensitivityLabel -fileInfo @{} -userDrive $siteDrive -resourceId $resourceId -headers $headers
+                                }
+                            }
+                            else {
+                                Write-Host "  ❌ Site drive is null or has no ID" -ForegroundColor Red
+                                if ($siteDrive) {
+                                    Write-Host "  Site drive properties: $($siteDrive.PSObject.Properties.Name -join ', ')" -ForegroundColor Yellow
                                 }
                             }
                         }
@@ -1156,4 +1182,4 @@ AcquireToken;
 Initialize-SensitivityLabelsCache;
 
 # Perform search for each query
-PerformSearch 
+PerformSearch
