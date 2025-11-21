@@ -334,9 +334,8 @@ $items = $itemsResponse.value | Where-Object {
 }
 ```
 
-## Limitations
+## Current Limitations
 
-- **Classic Pages Only**: Designed for classic SharePoint ASPX pages (not modern pages)
 - **Web Parts Support**: Limited to text, image, and link web parts
 - **Authentication**: Requires certificate-based authentication (no interactive login)
 - **SharePoint Online**: Optimized for SharePoint Online (not on-premises)
