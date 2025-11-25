@@ -31,7 +31,8 @@
 
 .NOTES
     Author: Mike Lee
-    Date: November 21, 2025
+    Date: 11/21/2025
+    Updated: 11/25/2025 Added handling for converting relative paths in both attributes and link text.
     Required Permissions: Sites.Read.All, Files.Read.All
 #>
 
@@ -281,6 +282,101 @@ function Invoke-GraphRequestWithRetry {
 
 #endregion
 
+#region Path Fixing Functions
+
+function Repair-RelativePathsInHtml {
+    param(
+        [string]$HtmlContent,
+        [string]$HostName
+    )
+    
+    Write-Log "Checking for relative paths in HTML content..."
+    
+    $fixedContent = $HtmlContent
+    $attrFixCount = 0
+    $textFixCount = 0
+    
+    # Quick check: does the content have any /sites/ paths at all?
+    if ($HtmlContent -notmatch '/sites/') {
+        Write-Log "No relative paths found" -Level INFO
+        return $HtmlContent
+    }
+    
+    # Pattern to match ONLY relative paths: (href|src)="/sites/..."
+    # This won't match absolute URLs like (href|src)="https://..."
+    $pattern = '(href|src)=["' + "']" + '(/sites/[^"' + "'" + ']+)["' + "']"
+    
+    # Find relative path matches (starts with / not http)
+    $matches = [regex]::Matches($HtmlContent, $pattern)
+    $relativeMatches = @()
+    foreach ($m in $matches) {
+        if ($m.Groups[2].Value -match '^/') {
+            $relativeMatches += $m
+        }
+    }
+    
+    if ($relativeMatches.Count -gt 0) {
+        Write-Log "Found $($relativeMatches.Count) relative path(s) in attributes to fix" -Level WARNING
+        
+        # Replace using regex callback - this processes each match once
+        $fixedContent = [regex]::Replace($HtmlContent, $pattern, {
+                param($match)
+                $attribute = $match.Groups[1].Value
+                $relativePath = $match.Groups[2].Value
+            
+                # Only fix if it starts with / (relative)
+                if ($relativePath -match '^/') {
+                    $absoluteUrl = "https://$HostName$relativePath"
+                    Write-Log "  Fixing attribute: $($match.Value) -> $attribute=`"$absoluteUrl`"" -Level INFO
+                    return "$attribute=`"$absoluteUrl`""
+                }
+                else {
+                    # Don't modify if already absolute
+                    return $match.Value
+                }
+            })
+        
+        # Count actual fixes by checking which matches started with /
+        $attrFixCount = ($relativeMatches | Where-Object { $_.Groups[2].Value -match '^/' }).Count
+        Write-Log "Fixed $attrFixCount relative path(s) in attributes" -Level SUCCESS
+    }
+    else {
+        Write-Log "No relative paths found in attributes" -Level INFO
+    }    # Now fix the link text content (the visible text between <a> tags)
+    # Pattern: <a ...>/sites/path</a>
+    $linkTextPattern = '<a\s+[^>]*>(/sites/[^<]+)</a>'
+    $linkTextMatches = [regex]::Matches($fixedContent, $linkTextPattern)
+    
+    if ($linkTextMatches.Count -gt 0) {
+        Write-Log "Found $($linkTextMatches.Count) link(s) with relative path text to fix" -Level WARNING
+        
+        # Use regex replace to fix each occurrence precisely
+        $fixedContent = [regex]::Replace($fixedContent, $linkTextPattern, {
+                param($match)
+                $relativePath = $match.Groups[1].Value  # /sites/... text content
+                $absoluteUrl = "https://$HostName$relativePath"
+            
+                Write-Log "  Fixing link text: $relativePath -> $absoluteUrl" -Level INFO
+            
+                # Replace only the text part, keeping the opening tag intact
+                return $match.Value -replace '(>)[^<]+(</a>)', "`$1$absoluteUrl`$2"
+            })
+        
+        $textFixCount = $linkTextMatches.Count
+        Write-Log "Fixed $textFixCount link(s) with relative path text" -Level SUCCESS
+    }
+    else {
+        Write-Log "No relative path text found in links" -Level INFO
+    }    $totalFixes = $attrFixCount + $textFixCount
+    if ($totalFixes -gt 0) {
+        Write-Log "Total fixes applied: $totalFixes" -Level SUCCESS
+    }
+    
+    return $fixedContent
+}
+
+#endregion
+
 #region ASPX to PDF Conversion
 
 function ConvertAspxToPdf {
@@ -493,6 +589,9 @@ function ConvertAspxToPdf {
             }
             
             $htmlContent += "</body></html>"
+            
+            # Fix relative paths in HTML content before saving
+            $htmlContent = Repair-RelativePathsInHtml -HtmlContent $htmlContent -HostName $hostname
             
             # Save HTML file
             $htmlFileName = [System.IO.Path]::GetFileNameWithoutExtension($fileName) + ".html"
