@@ -19,6 +19,15 @@
 .PARAMETER Thumbprint
     The certificate thumbprint for authentication.
 
+.PARAMETER AppAuthMode
+    Application authentication mode for Microsoft Graph and Entra-based Translator auth.
+    Use "Certificate" (default) to sign with a certificate private key.
+    Use "ClientSecret" to authenticate with an app secret and avoid private key prompts.
+
+.PARAMETER ClientSecret
+    The Azure AD application client secret. Defaults to AZURE_CLIENT_SECRET environment variable.
+    Required when AppAuthMode is "ClientSecret".
+
 .PARAMETER CertStore
     Certificate store location: "LocalMachine" or "CurrentUser" (default: "LocalMachine").
 
@@ -61,6 +70,7 @@
 .NOTES
     Author: Mike Lee
     Created: 06/25/2026
+    Updated: 6/29/2026 - Added ClientSecret support 
 
     Required setup:
     1. Grant the app registration Microsoft Graph application permission Sites.ReadWrite.All and admin consent.
@@ -83,11 +93,14 @@
 param(
     [string]$tenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3',
     [string]$clientId = 'abc64618-283f-47ba-a185-50d935d51d57',
+    [ValidateSet('Certificate', 'ClientSecret')]
+    [string]$AppAuthMode = 'Certificate',
     [string]$Thumbprint = "B696FDCFE1453F3FBC6031F54DE988DA0ED905A9",
+    [string]$ClientSecret = "",
     [ValidateSet('LocalMachine', 'CurrentUser')]
     [string]$CertStore = 'LocalMachine',
     [string]$siteUrl = "https://m365cpi13246019.sharepoint.com/sites/SalesandMarketing",
-    [string]$PageName = "TestPageEng.aspx",
+    [string]$PageName = "Testpage.aspx",
     [string]$TargetLanguage = "fr",
     [string]$SourceLanguage = "",
     [string]$OutputNameSuffix = "-fr",
@@ -238,12 +251,52 @@ function Get-CertificateAccessToken {
     return $response.access_token
 }
 
+function Get-ClientSecretAccessToken {
+    param(
+        [string]$Scope,
+        [string]$ServiceName
+    )
+
+    Write-Log "Requesting $ServiceName token using client secret authentication..."
+
+    if ([string]::IsNullOrWhiteSpace($ClientSecret)) {
+        throw "ClientSecret is required when AppAuthMode is ClientSecret. Pass -ClientSecret or set AZURE_CLIENT_SECRET."
+    }
+
+    $tokenUrl = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
+
+    $body = @{
+        client_id     = $clientId
+        client_secret = $ClientSecret
+        scope         = $Scope
+        grant_type    = "client_credentials"
+    }
+
+    $response = Invoke-RestMethod -Method Post -Uri $tokenUrl -Body $body -ContentType "application/x-www-form-urlencoded"
+    Write-Log "Successfully acquired $ServiceName token" -Level SUCCESS
+
+    return $response.access_token
+}
+
+function Get-AppAccessToken {
+    param(
+        [string]$Scope,
+        [string]$ServiceName
+    )
+
+    if ($AppAuthMode -eq 'ClientSecret') {
+        return Get-ClientSecretAccessToken -Scope $Scope -ServiceName $ServiceName
+    }
+
+    return Get-CertificateAccessToken -Scope $Scope -ServiceName $ServiceName
+}
+
 function Get-GraphToken {
-    $global:token = Get-CertificateAccessToken -Scope "https://graph.microsoft.com/.default" -ServiceName "Microsoft Graph"
+    $global:token = Get-AppAccessToken -Scope "https://graph.microsoft.com/.default" -ServiceName "Microsoft Graph"
 }
 
 function Get-CognitiveServicesToken {
-    $global:cognitiveServicesToken = Get-CertificateAccessToken -Scope "https://cognitiveservices.azure.com/.default" -ServiceName "Azure AI Services"
+    $global:cognitiveServicesToken = Get-AppAccessToken -Scope "https://cognitiveservices.azure.com/.default" -ServiceName "Azure AI Services"
 }
 
 function New-GraphHeaders {
@@ -469,6 +522,20 @@ function Get-TranslatorTranslateUri {
 }
 
 function Assert-TranslatorConfigured {
+    if ($AppAuthMode -eq 'ClientSecret') {
+        if ([string]::IsNullOrWhiteSpace($ClientSecret)) {
+            Write-Log "ClientSecret is required when AppAuthMode is ClientSecret. Pass -ClientSecret or set AZURE_CLIENT_SECRET." -Level ERROR
+            exit 1
+        }
+    }
+    else {
+        $certPath = "Cert:\$CertStore\My\$Thumbprint"
+        if (-not (Test-Path $certPath)) {
+            Write-Log "Certificate not found at $certPath" -Level ERROR
+            exit 1
+        }
+    }
+
     if ([string]::IsNullOrWhiteSpace($TargetLanguage)) {
         Write-Log "TargetLanguage is required." -Level ERROR
         exit 1
@@ -1071,6 +1138,7 @@ Write-Log "Site URL: $siteUrl" -Level INFO
 Write-Log "Input Page: $(if ($PageName) { $PageName } else { 'All ASPX pages' })" -Level INFO
 Write-Log "Target Language: $TargetLanguage" -Level INFO
 Write-Log "Output Name Suffix: $OutputNameSuffix" -Level INFO
+Write-Log "App Auth Mode: $AppAuthMode" -Level INFO
 Write-Log "Translator Auth Mode: $TranslatorAuthMode" -Level INFO
 Write-Log "Publish After Create: $(-not $Draft.IsPresent)" -Level INFO
 Write-Log "Log File: $logFile" -Level INFO
