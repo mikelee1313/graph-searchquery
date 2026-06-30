@@ -812,7 +812,7 @@ function Translate-ObjectText {
         foreach ($item in $Value) {
             $translatedArray += Translate-ObjectText -Value $item -PropertyName $PropertyName -TextSegmentsTranslated $TextSegmentsTranslated
         }
-        return ,$translatedArray
+        return , $translatedArray
     }
 
     if ($Value -is [System.Collections.IDictionary]) {
@@ -961,13 +961,13 @@ function ConvertTo-SharePointRestPathLiteral {
 
     $normalizedPath = $ServerRelativePath.Replace('\', '/')
     $encodedPath = (($normalizedPath.Split('/') | ForEach-Object {
-            if ([string]::IsNullOrEmpty($_)) {
-                ""
-            }
-            else {
-                [System.Uri]::EscapeDataString($_)
-            }
-        }) -join '/')
+                if ([string]::IsNullOrEmpty($_)) {
+                    ""
+                }
+                else {
+                    [System.Uri]::EscapeDataString($_)
+                }
+            }) -join '/')
 
     return ConvertTo-ODataStringLiteral -Value $encodedPath
 }
@@ -1385,17 +1385,17 @@ function New-RestCanvasWebPartControl {
     }
 
     $webPartData = [ordered]@{
-        id           = $webPartType
-        instanceId   = [guid]::NewGuid().ToString()
-        title        = ""
-        description  = ""
-        dataVersion  = "1.0"
-        properties   = [ordered]@{}
+        id                     = $webPartType
+        instanceId             = [guid]::NewGuid().ToString()
+        title                  = ""
+        description            = ""
+        dataVersion            = "1.0"
+        properties             = [ordered]@{}
         serverProcessedContent = [ordered]@{
-            htmlStrings      = [ordered]@{}
+            htmlStrings          = [ordered]@{}
             searchablePlainTexts = [ordered]@{}
-            imageSources     = [ordered]@{}
-            links            = [ordered]@{}
+            imageSources         = [ordered]@{}
+            links                = [ordered]@{}
         }
     }
 
@@ -1495,18 +1495,18 @@ function New-LayoutWebpartsContent {
     if ($Payload["titleArea"]) {
         $titleArea = $Payload["titleArea"]
         $layoutData = [ordered]@{
-            id                  = "cbe7b0a9-3504-44dd-a3a3-0e5cacd07788"
-            instanceId          = [guid]::NewGuid().ToString()
-            title               = "Title area"
-            description         = "Title area"
+            id                     = "cbe7b0a9-3504-44dd-a3a3-0e5cacd07788"
+            instanceId             = [guid]::NewGuid().ToString()
+            title                  = "Title area"
+            description            = "Title area"
             serverProcessedContent = [ordered]@{
-                htmlStrings           = [ordered]@{}
-                searchablePlainTexts  = [ordered]@{ title = [string]$Payload["title"] }
-                imageSources          = [ordered]@{}
-                links                 = [ordered]@{}
+                htmlStrings          = [ordered]@{}
+                searchablePlainTexts = [ordered]@{ title = [string]$Payload["title"] }
+                imageSources         = [ordered]@{}
+                links                = [ordered]@{}
             }
-            dataVersion         = "1.4"
-            properties          = $titleArea
+            dataVersion            = "1.4"
+            properties             = $titleArea
         }
         return ($layoutData | ConvertTo-Json -Depth 100 -Compress)
     }
@@ -1577,12 +1577,12 @@ function New-RestSubfolderTranslatedPage {
     $mergeHeaders["IF-MATCH"] = "*"
     $mergeHeaders["X-HTTP-Method"] = "MERGE"
     $bodyObject = @{
-        Title                  = $targetTitle
-        CanvasContent1         = $canvasContent
-        LayoutWebpartsContent  = $layoutWebpartsContent
+        Title                   = $targetTitle
+        CanvasContent1          = $canvasContent
+        LayoutWebpartsContent   = $layoutWebpartsContent
         ClientSideApplicationId = "b6917cb1-93a0-4b97-a84d-7cf49975d4ec"
-        PageLayoutType         = "Article"
-        PromotedState          = 0
+        PageLayoutType          = "Article"
+        PromotedState           = 0
     }
 
     if (-not [string]::IsNullOrWhiteSpace([string]$sourceItem.BannerImageUrl)) {
@@ -1870,7 +1870,7 @@ function Resolve-PageReference {
     $matches = @($Pages | Where-Object {
             $pageFolderPath = Get-FolderPathFromWebUrl -WebUrl $_.webUrl
             $folderMatches = [string]::IsNullOrWhiteSpace($candidateFolderPath) -or
-                $pageFolderPath.Equals($candidateFolderPath, [System.StringComparison]::OrdinalIgnoreCase)
+            $pageFolderPath.Equals($candidateFolderPath, [System.StringComparison]::OrdinalIgnoreCase)
 
             $folderMatches -and (
                 $_.name -eq $candidate -or
@@ -1884,7 +1884,7 @@ function Resolve-PageReference {
         $matches = @($Pages | Where-Object {
                 $pageFolderPath = Get-FolderPathFromWebUrl -WebUrl $_.webUrl
                 $folderMatches = [string]::IsNullOrWhiteSpace($candidateFolderPath) -or
-                    $pageFolderPath.Equals($candidateFolderPath, [System.StringComparison]::OrdinalIgnoreCase)
+                $pageFolderPath.Equals($candidateFolderPath, [System.StringComparison]::OrdinalIgnoreCase)
 
                 $folderMatches -and (
                     $_.name -like $candidate -or
@@ -1967,7 +1967,7 @@ function Remove-ReadOnlyPageProperties {
         foreach ($item in $Value) {
             $cleanArray += Remove-ReadOnlyPageProperties -Value $item
         }
-        return ,$cleanArray
+        return , $cleanArray
     }
 
     if ($Value -is [System.Collections.IDictionary]) {
@@ -2040,7 +2040,7 @@ function Remove-EmptyNestedTitleProperties {
         foreach ($item in $Value) {
             $cleanArray += Remove-EmptyNestedTitleProperties -Value $item
         }
-        return ,$cleanArray
+        return , $cleanArray
     }
 
     if ($Value -is [System.Collections.IDictionary]) {
@@ -2208,12 +2208,12 @@ function New-TranslatedPagePayload {
     }
 
     $payload = [ordered]@{
-        "@odata.type"          = "#microsoft.graph.sitePage"
-        name                   = $NewPageName
-        title                  = $translatedTitle
-        pageLayout             = $(if ($SourcePageContent.pageLayout) { $SourcePageContent.pageLayout } else { "article" })
-        showComments           = $SourcePageContent.showComments
-        showRecommendedPages   = $SourcePageContent.showRecommendedPages
+        "@odata.type"        = "#microsoft.graph.sitePage"
+        name                 = $NewPageName
+        title                = $translatedTitle
+        pageLayout           = $(if ($SourcePageContent.pageLayout) { $SourcePageContent.pageLayout } else { "article" })
+        showComments         = $SourcePageContent.showComments
+        showRecommendedPages = $SourcePageContent.showRecommendedPages
     }
 
     if ($SourcePageContent.description) {
