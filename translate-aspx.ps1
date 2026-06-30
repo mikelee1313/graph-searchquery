@@ -56,6 +56,11 @@
 .PARAMETER AzureTranslatorRegion
     Azure AI Translator region. Defaults to the AZURE_TRANSLATOR_REGION environment variable.
 
+.PARAMETER TranslatorTenantId
+    Optional tenant ID used only for Entra token acquisition to Azure AI Translator.
+    Use this when Microsoft Graph and Translator are in different tenants.
+    If omitted, tenantId is used for both services.
+
 .PARAMETER TranslatorAuthMode
     Translator authentication mode. Use "Entra" when API key based authentication is disabled.
     Use "Key" to authenticate with AzureTranslatorKey.
@@ -71,6 +76,7 @@
     Author: Mike Lee
     Created: 06/25/2026
     Updated: 6/29/2026 - Added ClientSecret support 
+    Updated: 6/30/2026 - Added support for translations from subfolders (Via REST)
 
     Required setup:
     1. Grant the app registration Microsoft Graph application permission Sites.ReadWrite.All and admin consent.
@@ -100,13 +106,14 @@ param(
     [ValidateSet('LocalMachine', 'CurrentUser')]
     [string]$CertStore = 'LocalMachine',
     [string]$siteUrl = "https://m365cpi13246019.sharepoint.com/sites/SalesandMarketing",
-    [string]$PageName = "Testpage.aspx",
+    [string]$PageName = "Testpageinfolder-eng2.aspx",
     [string]$TargetLanguage = "fr",
     [string]$SourceLanguage = "",
     [string]$OutputNameSuffix = "-fr",
     [string]$AzureTranslatorKey = $env:AZURE_TRANSLATOR_KEY,
     [string]$AzureTranslatorEndpoint = 'https://m365cpi13246019azureservices.cognitiveservices.azure.com/',
     [string]$AzureTranslatorRegion = 'eastus',
+    [string]$TranslatorTenantId = '',
     [ValidateSet('Entra', 'Key')]
     [string]$TranslatorAuthMode = 'Entra',
     [switch]$Draft
@@ -125,9 +132,11 @@ $logFile = Join-Path -Path $logFolder -ChildPath "translation_log_$date.log"
 $csvLog = Join-Path -Path $logFolder -ChildPath "translation_summary_$date.csv"
 
 $global:token = ""
+$global:sharePointToken = ""
 $global:cognitiveServicesToken = ""
 $global:translationResults = @()
 $script:translationCache = @{}
+$script:sitePagesDriveIds = @{}
 
 #endregion
 
@@ -193,7 +202,8 @@ function Add-TranslationResult {
 function Get-CertificateAccessToken {
     param(
         [string]$Scope,
-        [string]$ServiceName
+        [string]$ServiceName,
+        [string]$AuthorityTenantId = $tenantId
     )
 
     Write-Log "Requesting $ServiceName token using certificate authentication..."
@@ -206,7 +216,7 @@ function Get-CertificateAccessToken {
     $cert = Get-Item $certPath
     Write-Log "Certificate found in $CertStore\My store" -Level SUCCESS
 
-    $tokenUrl = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
+    $tokenUrl = "https://login.microsoftonline.com/$AuthorityTenantId/oauth2/v2.0/token"
 
     $jwtHeader = @{
         alg = "RS256"
@@ -254,7 +264,8 @@ function Get-CertificateAccessToken {
 function Get-ClientSecretAccessToken {
     param(
         [string]$Scope,
-        [string]$ServiceName
+        [string]$ServiceName,
+        [string]$AuthorityTenantId = $tenantId
     )
 
     Write-Log "Requesting $ServiceName token using client secret authentication..."
@@ -263,7 +274,7 @@ function Get-ClientSecretAccessToken {
         throw "ClientSecret is required when AppAuthMode is ClientSecret. Pass -ClientSecret or set AZURE_CLIENT_SECRET."
     }
 
-    $tokenUrl = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
+    $tokenUrl = "https://login.microsoftonline.com/$AuthorityTenantId/oauth2/v2.0/token"
 
     $body = @{
         client_id     = $clientId
@@ -281,22 +292,36 @@ function Get-ClientSecretAccessToken {
 function Get-AppAccessToken {
     param(
         [string]$Scope,
-        [string]$ServiceName
+        [string]$ServiceName,
+        [string]$AuthorityTenantId = $tenantId
     )
 
     if ($AppAuthMode -eq 'ClientSecret') {
-        return Get-ClientSecretAccessToken -Scope $Scope -ServiceName $ServiceName
+        return Get-ClientSecretAccessToken -Scope $Scope -ServiceName $ServiceName -AuthorityTenantId $AuthorityTenantId
     }
 
-    return Get-CertificateAccessToken -Scope $Scope -ServiceName $ServiceName
+    return Get-CertificateAccessToken -Scope $Scope -ServiceName $ServiceName -AuthorityTenantId $AuthorityTenantId
+}
+
+function Get-EffectiveTranslatorTenantId {
+    if ([string]::IsNullOrWhiteSpace($TranslatorTenantId)) {
+        return $tenantId
+    }
+
+    return $TranslatorTenantId.Trim()
 }
 
 function Get-GraphToken {
-    $global:token = Get-AppAccessToken -Scope "https://graph.microsoft.com/.default" -ServiceName "Microsoft Graph"
+    $global:token = Get-AppAccessToken -Scope "https://graph.microsoft.com/.default" -ServiceName "Microsoft Graph" -AuthorityTenantId $tenantId
+}
+
+function Get-SharePointToken {
+    $siteUri = [System.Uri]$siteUrl
+    $global:sharePointToken = Get-AppAccessToken -Scope "https://$($siteUri.Host)/.default" -ServiceName "SharePoint" -AuthorityTenantId $tenantId
 }
 
 function Get-CognitiveServicesToken {
-    $global:cognitiveServicesToken = Get-AppAccessToken -Scope "https://cognitiveservices.azure.com/.default" -ServiceName "Azure AI Services"
+    $global:cognitiveServicesToken = Get-AppAccessToken -Scope "https://cognitiveservices.azure.com/.default" -ServiceName "Azure AI Services" -AuthorityTenantId (Get-EffectiveTranslatorTenantId)
 }
 
 function New-GraphHeaders {
@@ -314,6 +339,14 @@ function New-GraphHeaders {
     }
 
     return $headers
+}
+
+function New-SharePointHeaders {
+    return @{
+        "Authorization" = "Bearer $global:sharePointToken"
+        "Accept"        = "application/json;odata=nometadata"
+        "Content-Type"  = "application/json;odata=nometadata"
+    }
 }
 
 #endregion
@@ -363,6 +396,60 @@ function Invoke-GraphRequestWithRetry {
 
                 if ($retryCount -lt $MaxRetries) {
                     Write-Log "Graph request returned $statusCode. Retrying in $retryAfter seconds ($($retryCount + 1)/$MaxRetries)..." -Level WARNING
+                    Start-Sleep -Seconds $retryAfter
+                    $retryCount++
+                    continue
+                }
+            }
+
+            throw
+        }
+    }
+}
+
+function Invoke-SharePointRequestWithRetry {
+    param(
+        [string]$Uri,
+        [hashtable]$Headers,
+        [string]$Method = "GET",
+        [object]$Body = $null,
+        [string]$ContentType = "application/json;odata=nometadata",
+        [int]$MaxRetries = 5
+    )
+
+    $retryCount = 0
+    $baseDelay = 1
+
+    while ($retryCount -le $MaxRetries) {
+        try {
+            $params = @{
+                Uri         = $Uri
+                Headers     = $Headers
+                Method      = $Method
+                ContentType = $ContentType
+            }
+
+            if ($null -ne $Body) {
+                $params['Body'] = $Body
+            }
+
+            return Invoke-RestMethod @params
+        }
+        catch {
+            $statusCode = $null
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            }
+
+            if ($statusCode -eq 429 -or ($statusCode -ge 500 -and $statusCode -lt 600)) {
+                $retryAfter = [Math]::Pow(2, $retryCount) * $baseDelay
+
+                if ($_.Exception.Response.Headers -and $_.Exception.Response.Headers['Retry-After']) {
+                    $retryAfter = [int]$_.Exception.Response.Headers['Retry-After']
+                }
+
+                if ($retryCount -lt $MaxRetries) {
+                    Write-Log "SharePoint REST request returned $statusCode. Retrying in $retryAfter seconds ($($retryCount + 1)/$MaxRetries)..." -Level WARNING
                     Start-Sleep -Seconds $retryAfter
                     $retryCount++
                     continue
@@ -442,6 +529,11 @@ function Invoke-TranslatorRequestWithRetry {
             }
 
             if ($statusCode -eq 400) {
+                if ($TranslatorAuthMode -eq 'Entra' -and $responseBody -match 'Token tenant .* does not match resource tenant|Tenant provided in token does not match resource token') {
+                    $effectiveTranslatorTenantId = Get-EffectiveTranslatorTenantId
+                    throw "Azure AI Translator tenant mismatch (400). Response body: $responseBody The token tenant does not match the Translator resource tenant. If Graph and Translator are in different tenants, set -TranslatorTenantId to the Translator resource tenant (current effective Translator tenant: '$effectiveTranslatorTenantId'). If using API key auth, run with -TranslatorAuthMode Key so no Entra token is sent."
+                }
+
                 throw "Azure AI Translator request failed (400) for endpoint '$Uri'. Response body: $responseBody"
             }
 
@@ -565,6 +657,9 @@ function Assert-TranslatorConfigured {
     Write-Log "Translator translate URL pattern: $(Get-TranslatorTranslateUri -TextType plain)"
     Write-Log "Translator region header: $(if ($translatorRegion) { $translatorRegion } else { '<not set>' })"
     Write-Log "Translator auth mode: $TranslatorAuthMode"
+    if ($TranslatorAuthMode -eq 'Entra') {
+        Write-Log "Translator token tenant: $(Get-EffectiveTranslatorTenantId)"
+    }
     Write-Log "Translator key configured: $(if ($AzureTranslatorKey) { 'yes' } else { 'no' })"
 }
 
@@ -773,8 +868,993 @@ function Get-AllSitePages {
     return @($pages | Where-Object { $_.name -like "*.aspx" })
 }
 
+function Get-SitePageByWebUrl {
+    param(
+        [string]$SiteId,
+        [string]$WebUrl
+    )
+
+    $targetUrl = [System.Uri]::UnescapeDataString($WebUrl).TrimEnd('/')
+    $pages = Get-AllSitePages -SiteId $SiteId
+    return @($pages | Where-Object {
+            $_.webUrl -and
+            [System.Uri]::UnescapeDataString($_.webUrl).TrimEnd('/').Equals($targetUrl, [System.StringComparison]::OrdinalIgnoreCase)
+        } | Select-Object -First 1)
+}
+
+function Wait-SitePageByWebUrl {
+    param(
+        [string]$SiteId,
+        [string]$WebUrl,
+        [int]$MaxAttempts = 5
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $page = Get-SitePageByWebUrl -SiteId $SiteId -WebUrl $WebUrl
+        if ($page.Count -gt 0) {
+            return $page[0]
+        }
+
+        if ($attempt -lt $MaxAttempts) {
+            Write-Log "Page not yet available through Graph Pages API. Retrying lookup ($attempt/$MaxAttempts)..." -Level WARNING
+            Start-Sleep -Seconds 2
+        }
+    }
+
+    throw "Could not resolve site page through Graph Pages API: $WebUrl"
+}
+
+function ConvertTo-GraphDrivePath {
+    param(
+        [string]$Path
+    )
+
+    $normalizedPath = $Path.Replace('\', '/').Trim('/')
+    if ([string]::IsNullOrWhiteSpace($normalizedPath)) {
+        return ""
+    }
+
+    $segments = @($normalizedPath.Split('/') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    return (($segments | ForEach-Object { [System.Uri]::EscapeDataString($_) }) -join '/')
+}
+
+function Get-SiteServerRelativePath {
+    $siteUri = [System.Uri]$siteUrl
+    return [System.Uri]::UnescapeDataString($siteUri.AbsolutePath.TrimEnd('/'))
+}
+
+function Get-SitePagesFileServerRelativePath {
+    param(
+        [string]$FolderPath,
+        [string]$PageName
+    )
+
+    $siteRelativePath = Get-SiteServerRelativePath
+    $normalizedFolderPath = $FolderPath.Replace('\', '/').Trim('/')
+    if ([string]::IsNullOrWhiteSpace($normalizedFolderPath)) {
+        return "$siteRelativePath/SitePages/$PageName"
+    }
+
+    return "$siteRelativePath/SitePages/$normalizedFolderPath/$PageName"
+}
+
+function Get-ServerRelativePathFromWebUrl {
+    param(
+        [string]$WebUrl
+    )
+
+    return [System.Uri]::UnescapeDataString(([System.Uri]$WebUrl).AbsolutePath)
+}
+
+function ConvertTo-ODataStringLiteral {
+    param(
+        [string]$Value
+    )
+
+    return $Value.Replace("'", "''")
+}
+
+function ConvertTo-SharePointRestPathLiteral {
+    param(
+        [string]$ServerRelativePath
+    )
+
+    $normalizedPath = $ServerRelativePath.Replace('\', '/')
+    $encodedPath = (($normalizedPath.Split('/') | ForEach-Object {
+            if ([string]::IsNullOrEmpty($_)) {
+                ""
+            }
+            else {
+                [System.Uri]::EscapeDataString($_)
+            }
+        }) -join '/')
+
+    return ConvertTo-ODataStringLiteral -Value $encodedPath
+}
+
+function ConvertTo-SharePointWebUrl {
+    param(
+        [string]$ServerRelativePath
+    )
+
+    $siteUri = [System.Uri]$siteUrl
+    $normalizedPath = $ServerRelativePath.Replace('\', '/').Trim('/')
+    $encodedPath = (($normalizedPath.Split('/') | ForEach-Object { [System.Uri]::EscapeDataString($_) }) -join '/')
+    return "https://$($siteUri.Host)/$encodedPath"
+}
+
+function ConvertTo-GraphShareId {
+    param(
+        [string]$WebUrl
+    )
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($WebUrl)
+    $base64 = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('/', '_').Replace('+', '-')
+    return "u!$base64"
+}
+
+function Get-GraphDriveItemByWebUrl {
+    param(
+        [string]$WebUrl
+    )
+
+    $headers = New-GraphHeaders -MetadataNone
+    $shareId = ConvertTo-GraphShareId -WebUrl $WebUrl
+    $itemUrl = "https://graph.microsoft.com/v1.0/shares/$shareId/driveItem"
+    return Invoke-GraphRequestWithRetry -Uri $itemUrl -Headers $headers -Method GET
+}
+
+function Get-SharePointFileListItemByPath {
+    param(
+        [string]$ServerRelativePath,
+        [string[]]$Select = @("Id", "GUID", "UniqueId", "FileLeafRef", "Title")
+    )
+
+    if ([string]::IsNullOrWhiteSpace($global:sharePointToken)) {
+        Get-SharePointToken
+    }
+
+    $headers = New-SharePointHeaders
+    $pathLiteral = ConvertTo-SharePointRestPathLiteral -ServerRelativePath $ServerRelativePath
+    $selectQuery = ($Select | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ','
+    $itemUrl = "$($siteUrl.TrimEnd('/'))/_api/web/GetFileByServerRelativePath(decodedurl='$pathLiteral')/ListItemAllFields?`$select=$selectQuery"
+    return Invoke-SharePointRequestWithRetry -Uri $itemUrl -Headers $headers -Method GET
+}
+
+function Get-SharePointFileListItemAllFieldsByPath {
+    param(
+        [string]$ServerRelativePath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($global:sharePointToken)) {
+        Get-SharePointToken
+    }
+
+    $headers = New-SharePointHeaders
+    $pathLiteral = ConvertTo-SharePointRestPathLiteral -ServerRelativePath $ServerRelativePath
+    $itemUrl = "$($siteUrl.TrimEnd('/'))/_api/web/GetFileByServerRelativePath(decodedurl='$pathLiteral')/ListItemAllFields"
+    return Invoke-SharePointRequestWithRetry -Uri $itemUrl -Headers $headers -Method GET
+}
+
+function Get-SharePointFileFieldValuesForEditByPath {
+    param(
+        [string]$ServerRelativePath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($global:sharePointToken)) {
+        Get-SharePointToken
+    }
+
+    $headers = New-SharePointHeaders
+    $pathLiteral = ConvertTo-SharePointRestPathLiteral -ServerRelativePath $ServerRelativePath
+    $itemUrl = "$($siteUrl.TrimEnd('/'))/_api/web/GetFileByServerRelativePath(decodedurl='$pathLiteral')/ListItemAllFields/FieldValuesForEdit"
+    return Invoke-SharePointRequestWithRetry -Uri $itemUrl -Headers $headers -Method GET
+}
+
+function Get-SharePointSitePageByListItemId {
+    param(
+        [int]$ListItemId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($global:sharePointToken)) {
+        Get-SharePointToken
+    }
+
+    $headers = New-SharePointHeaders
+    $pageUrl = "$($siteUrl.TrimEnd('/'))/_api/sitepages/pages($ListItemId)"
+    return Invoke-SharePointRequestWithRetry -Uri $pageUrl -Headers $headers -Method GET
+}
+
+function Save-SharePointSitePageByListItemId {
+    param(
+        [int]$ListItemId,
+        [hashtable]$Fields
+    )
+
+    if ([string]::IsNullOrWhiteSpace($global:sharePointToken)) {
+        Get-SharePointToken
+    }
+
+    $headers = New-SharePointHeaders
+    $saveUrl = "$($siteUrl.TrimEnd('/'))/_api/sitepages/pages($ListItemId)/SavePage"
+    $body = $Fields | ConvertTo-Json -Depth 100
+
+    Write-Log "Saving page content through Site Pages SavePage endpoint for list item $ListItemId."
+    Invoke-SharePointRequestWithRetry -Uri $saveUrl -Headers $headers -Method POST -Body $body | Out-Null
+}
+
+function Test-SharePointFileExists {
+    param(
+        [string]$ServerRelativePath
+    )
+
+    try {
+        Get-SharePointFileListItemByPath -ServerRelativePath $ServerRelativePath | Out-Null
+        return $true
+    }
+    catch {
+        $statusCode = $null
+        $responseDetails = [string]$_.ErrorDetails.Message
+        if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+        }
+
+        if (
+            $statusCode -eq 404 -or
+            ($statusCode -in @(400, 403) -and $responseDetails -match 'sharesAccessDenied|0x80070002|cannot find the file|File Not Found|not found|does not exist|invalid|System.IO.FileNotFoundException')
+        ) {
+            return $false
+        }
+
+        throw
+    }
+}
+
+function Move-SharePointFile {
+    param(
+        [string]$SourceServerRelativePath,
+        [string]$TargetServerRelativePath
+    )
+
+    $sourceWebUrl = ConvertTo-SharePointWebUrl -ServerRelativePath $SourceServerRelativePath
+    $targetWebUrl = ConvertTo-SharePointWebUrl -ServerRelativePath $TargetServerRelativePath
+
+    if ([string]::IsNullOrWhiteSpace($global:sharePointToken)) {
+        Get-SharePointToken
+    }
+
+    $headers = New-SharePointHeaders
+    $moveUrl = "$($siteUrl.TrimEnd('/'))/_api/SP.MoveCopyUtil.MoveFileByPath(overwrite=@a1)?@a1=false"
+    $moveBody = @{
+        srcPath  = @{
+            DecodedUrl = $sourceWebUrl
+        }
+        destPath = @{
+            DecodedUrl = $targetWebUrl
+        }
+        options  = @{
+            KeepBoth                    = $false
+            ResetAuthorAndCreatedOnCopy = $false
+            ShouldBypassSharedLocks     = $true
+        }
+    } | ConvertTo-Json -Depth 10
+
+    Invoke-SharePointRequestWithRetry -Uri $moveUrl -Headers $headers -Method POST -Body $moveBody | Out-Null
+    return [PSCustomObject]@{
+        webUrl = $targetWebUrl
+    }
+}
+
+function Publish-SharePointFileByPath {
+    param(
+        [string]$ServerRelativePath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($global:sharePointToken)) {
+        Get-SharePointToken
+    }
+
+    $headers = New-SharePointHeaders
+    $pathLiteral = ConvertTo-SharePointRestPathLiteral -ServerRelativePath $ServerRelativePath
+    $checkInUrl = "$($siteUrl.TrimEnd('/'))/_api/web/GetFileByServerRelativePath(decodedurl='$pathLiteral')/CheckIn(comment='Translated%20page',checkintype=1)"
+    $publishUrl = "$($siteUrl.TrimEnd('/'))/_api/web/GetFileByServerRelativePath(decodedurl='$pathLiteral')/Publish(comment='Translated%20page')"
+
+    $maxPublishAttempts = 12
+    $checkInCompleted = $false
+    $lastCheckInError = $null
+    for ($attempt = 1; $attempt -le $maxPublishAttempts; $attempt++) {
+        try {
+            Invoke-SharePointRequestWithRetry -Uri $checkInUrl -Headers $headers -Method POST | Out-Null
+            $checkInCompleted = $true
+            break
+        }
+        catch {
+            $lastCheckInError = $_
+            $statusCode = $null
+            $responseDetails = [string]$_.ErrorDetails.Message
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            }
+
+            if ($responseDetails -match 'not checked out|not checked|no checked out|does not require check') {
+                Write-Log "Page did not require check-in before publish." -Level INFO
+                $checkInCompleted = $true
+                break
+            }
+
+            if ($statusCode -eq 423 -and $attempt -lt $maxPublishAttempts) {
+                $waitSeconds = [Math]::Min(5 * $attempt, 30)
+                Write-Log "Page is locked during check-in. Retrying in $waitSeconds seconds ($attempt/$maxPublishAttempts)..." -Level WARNING
+                Start-Sleep -Seconds $waitSeconds
+                continue
+            }
+
+            throw
+        }
+    }
+
+    if (-not $checkInCompleted) {
+        throw "Could not check in page before publish because it remained locked after $maxPublishAttempts attempts. Last error: $($lastCheckInError.Exception.Message)"
+    }
+
+    for ($attempt = 1; $attempt -le $maxPublishAttempts; $attempt++) {
+        try {
+            Invoke-SharePointRequestWithRetry -Uri $publishUrl -Headers $headers -Method POST | Out-Null
+            Write-Log "Published SharePoint page: $ServerRelativePath" -Level SUCCESS
+            return
+        }
+        catch {
+            $statusCode = $null
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            }
+
+            if ($statusCode -eq 423 -and $attempt -lt $maxPublishAttempts) {
+                $waitSeconds = [Math]::Min(5 * $attempt, 30)
+                Write-Log "Page is locked during publish. Retrying in $waitSeconds seconds ($attempt/$maxPublishAttempts)..." -Level WARNING
+                Start-Sleep -Seconds $waitSeconds
+                continue
+            }
+
+            throw
+        }
+    }
+
+    throw "Could not publish page after $maxPublishAttempts attempts."
+}
+
+function Set-SharePointPageFieldsByValidateUpdate {
+    param(
+        [string]$ServerRelativePath,
+        [hashtable]$Fields
+    )
+
+    if ([string]::IsNullOrWhiteSpace($global:sharePointToken)) {
+        Get-SharePointToken
+    }
+
+    $headers = New-SharePointHeaders
+    $pathLiteral = ConvertTo-SharePointRestPathLiteral -ServerRelativePath $ServerRelativePath
+    $updateUrl = "$($siteUrl.TrimEnd('/'))/_api/web/GetFileByServerRelativePath(decodedurl='$pathLiteral')/ListItemAllFields/ValidateUpdateListItem()"
+    $formValues = @()
+    foreach ($key in $Fields.Keys) {
+        if ($null -ne $Fields[$key]) {
+            $formValues += @{
+                FieldName  = $key
+                FieldValue = [string]$Fields[$key]
+            }
+        }
+    }
+
+    $body = @{
+        formValues         = $formValues
+        bNewDocumentUpdate = $true
+    } | ConvertTo-Json -Depth 20
+
+    Write-Log "Updating Site Pages fields with ValidateUpdateListItem: $($Fields.Keys -join ', ')"
+    Invoke-SharePointRequestWithRetry -Uri $updateUrl -Headers $headers -Method POST -Body $body | Out-Null
+}
+
+function Get-NestedPropertyValue {
+    param(
+        [object]$Value,
+        [string[]]$PropertyNames
+    )
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    if ($Value -is [System.Collections.IDictionary]) {
+        foreach ($propertyName in $PropertyNames) {
+            if ($Value.Contains($propertyName) -and -not [string]::IsNullOrWhiteSpace([string]($Value[$propertyName]))) {
+                return $Value[$propertyName]
+            }
+        }
+
+        foreach ($key in $Value.Keys) {
+            $nestedValue = Get-NestedPropertyValue -Value $Value[$key] -PropertyNames $PropertyNames
+            if ($null -ne $nestedValue) {
+                return $nestedValue
+            }
+        }
+    }
+    elseif ($Value -is [array]) {
+        foreach ($item in $Value) {
+            $nestedValue = Get-NestedPropertyValue -Value $item -PropertyNames $PropertyNames
+            if ($null -ne $nestedValue) {
+                return $nestedValue
+            }
+        }
+    }
+    elseif ($Value -is [pscustomobject]) {
+        foreach ($propertyName in $PropertyNames) {
+            $property = $Value.PSObject.Properties[$propertyName]
+            if ($property -and -not [string]::IsNullOrWhiteSpace([string]($property.Value))) {
+                return $property.Value
+            }
+        }
+
+        foreach ($property in $Value.PSObject.Properties) {
+            $nestedValue = Get-NestedPropertyValue -Value $property.Value -PropertyNames $PropertyNames
+            if ($null -ne $nestedValue) {
+                return $nestedValue
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-ImageWebPartDetails {
+    param(
+        [object]$WebPart
+    )
+
+    $imageUrl = Get-NestedPropertyValue -Value $WebPart -PropertyNames @(
+        "imageSource",
+        "imageUrl",
+        "serverRelativeUrl",
+        "serverRelativeImageUrl",
+        "originalImageUrl",
+        "url"
+    )
+
+    if ($imageUrl -and $imageUrl -match '^https?://') {
+        $siteUri = [System.Uri]$siteUrl
+        if (([System.Uri]$imageUrl).Host -ne $siteUri.Host) {
+            $imageUrl = $null
+        }
+    }
+
+    if ($imageUrl -and $imageUrl -notmatch '^https?://' -and $imageUrl -notmatch '^/') {
+        $imageUrl = $null
+    }
+
+    return [PSCustomObject]@{
+        ImageUrl        = $imageUrl
+        Caption         = Get-NestedPropertyValue -Value $WebPart -PropertyNames @("captionText", "caption")
+        AlternativeText = Get-NestedPropertyValue -Value $WebPart -PropertyNames @("altText", "alternativeText")
+        Width           = Get-NestedPropertyValue -Value $WebPart -PropertyNames @("imgWidth", "imageWidth", "width")
+        Height          = Get-NestedPropertyValue -Value $WebPart -PropertyNames @("imgHeight", "imageHeight", "height")
+    }
+}
+
+function New-RestCanvasControlPosition {
+    param(
+        [int]$SectionIndex,
+        [int]$ColumnIndex,
+        [int]$ControlIndex
+    )
+
+    return [ordered]@{
+        zoneIndex    = $SectionIndex
+        sectionIndex = $ColumnIndex
+        controlIndex = $ControlIndex
+        layoutIndex  = 1
+    }
+}
+
+function New-RestCanvasTextControl {
+    param(
+        [string]$Html,
+        [int]$SectionIndex,
+        [int]$ColumnIndex,
+        [int]$ControlIndex
+    )
+
+    return [ordered]@{
+        controlType = 4
+        id          = [guid]::NewGuid().ToString()
+        position    = New-RestCanvasControlPosition -SectionIndex $SectionIndex -ColumnIndex $ColumnIndex -ControlIndex $ControlIndex
+        innerHTML   = $Html
+    }
+}
+
+function New-RestCanvasWebPartControl {
+    param(
+        [object]$WebPart,
+        [int]$SectionIndex,
+        [int]$ColumnIndex,
+        [int]$ControlIndex
+    )
+
+    $webPartType = [string]$WebPart["webPartType"]
+    if ([string]::IsNullOrWhiteSpace($webPartType) -or $webPartType -eq "cbe7b0a9-3504-44dd-a3a3-0e5cacd07788") {
+        return $null
+    }
+
+    $webPartData = [ordered]@{
+        id           = $webPartType
+        instanceId   = [guid]::NewGuid().ToString()
+        title        = ""
+        description  = ""
+        dataVersion  = "1.0"
+        properties   = [ordered]@{}
+        serverProcessedContent = [ordered]@{
+            htmlStrings      = [ordered]@{}
+            searchablePlainTexts = [ordered]@{}
+            imageSources     = [ordered]@{}
+            links            = [ordered]@{}
+        }
+    }
+
+    if ($WebPart.Contains("data")) {
+        $data = $WebPart["data"]
+        if ($data -is [System.Collections.IDictionary]) {
+            foreach ($key in @("title", "description", "dataVersion", "properties", "serverProcessedContent")) {
+                if ($data.Contains($key) -and $null -ne $data[$key]) {
+                    $webPartData[$key] = $data[$key]
+                }
+            }
+        }
+    }
+
+    return [ordered]@{
+        controlType = 3
+        id          = [guid]::NewGuid().ToString()
+        position    = New-RestCanvasControlPosition -SectionIndex $SectionIndex -ColumnIndex $ColumnIndex -ControlIndex $ControlIndex
+        webPartId   = $webPartType
+        webPartData = $webPartData
+    }
+}
+
+function Convert-GraphPayloadToRestCanvasContent {
+    param(
+        [object]$Payload
+    )
+
+    $controls = @()
+    $sectionIndex = 1
+    if ($Payload["canvasLayout"] -and $Payload["canvasLayout"].Contains("horizontalSections")) {
+        foreach ($section in $Payload["canvasLayout"]["horizontalSections"]) {
+            $columnIndex = 1
+            foreach ($column in @($section["columns"])) {
+                $controlIndex = 1
+                foreach ($webPart in @($column["webparts"])) {
+                    if ($webPart.Contains("innerHtml") -and -not [string]::IsNullOrWhiteSpace([string]$webPart["innerHtml"])) {
+                        $controls += New-RestCanvasTextControl -Html ([string]$webPart["innerHtml"]) `
+                            -SectionIndex $sectionIndex -ColumnIndex $columnIndex -ControlIndex $controlIndex
+                    }
+                    elseif ($webPart.Contains("webPartType")) {
+                        $control = New-RestCanvasWebPartControl -WebPart $webPart `
+                            -SectionIndex $sectionIndex -ColumnIndex $columnIndex -ControlIndex $controlIndex
+                        if ($null -ne $control) {
+                            $controls += $control
+                        }
+                    }
+
+                    $controlIndex++
+                }
+
+                $columnIndex++
+            }
+
+            $sectionIndex++
+        }
+    }
+
+    return ($controls | ConvertTo-Json -Depth 100 -Compress)
+}
+
+function Translate-SharePointJsonField {
+    param(
+        [string]$Json,
+        [ref]$TextSegmentsTranslated
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Json)) {
+        return ""
+    }
+
+    try {
+        $jsonObject = $Json | ConvertFrom-Json -Depth 100
+    }
+    catch {
+        if ($Json.TrimStart().StartsWith("<")) {
+            $translatedHtml = Translate-Text -Text $Json -TextType html -Context "SharePoint CanvasContent1 HTML"
+            if ($translatedHtml -ne $Json) {
+                $TextSegmentsTranslated.Value++
+            }
+            return $translatedHtml
+        }
+
+        Write-Log "Could not parse SharePoint page JSON field for translation. Keeping original value. Error: $($_.Exception.Message)" -Level WARNING
+        return $Json
+    }
+
+    $translatedObject = Translate-ObjectText -Value $jsonObject -TextSegmentsTranslated $TextSegmentsTranslated
+    return ($translatedObject | ConvertTo-Json -Depth 100 -Compress)
+}
+
+function New-LayoutWebpartsContent {
+    param(
+        [object]$Payload
+    )
+
+    if ($Payload["titleArea"]) {
+        $titleArea = $Payload["titleArea"]
+        $layoutData = [ordered]@{
+            id                  = "cbe7b0a9-3504-44dd-a3a3-0e5cacd07788"
+            instanceId          = [guid]::NewGuid().ToString()
+            title               = "Title area"
+            description         = "Title area"
+            serverProcessedContent = [ordered]@{
+                htmlStrings           = [ordered]@{}
+                searchablePlainTexts  = [ordered]@{ title = [string]$Payload["title"] }
+                imageSources          = [ordered]@{}
+                links                 = [ordered]@{}
+            }
+            dataVersion         = "1.4"
+            properties          = $titleArea
+        }
+        return ($layoutData | ConvertTo-Json -Depth 100 -Compress)
+    }
+
+    return ""
+}
+
+function New-RestSubfolderTranslatedPage {
+    param(
+        [object]$Page,
+        [object]$SourceContent,
+        [string]$TargetPageName,
+        [ref]$TextSegmentsTranslated,
+        [switch]$Publish
+    )
+
+    $sourceFolderPath = Get-FolderPathFromWebUrl -WebUrl $Page.webUrl
+    $targetServerRelativePath = Get-SitePagesFileServerRelativePath -FolderPath $sourceFolderPath -PageName $TargetPageName
+    $targetFolderPath = [System.IO.Path]::GetDirectoryName($targetServerRelativePath).Replace('\', '/')
+    $targetFileName = [System.IO.Path]::GetFileName($targetServerRelativePath)
+    $payload = New-TranslatedPagePayload -SourcePageContent $SourceContent -NewPageName $TargetPageName `
+        -TextSegmentsTranslated $TextSegmentsTranslated
+    $targetTitle = $payload["title"]
+    if ([string]::IsNullOrWhiteSpace($targetTitle)) {
+        $targetTitle = [System.IO.Path]::GetFileNameWithoutExtension($TargetPageName)
+    }
+
+    if ([string]::IsNullOrWhiteSpace($global:sharePointToken)) {
+        Get-SharePointToken
+    }
+
+    $headers = New-SharePointHeaders
+    $folderLiteral = ConvertTo-SharePointRestPathLiteral -ServerRelativePath $targetFolderPath
+    $targetPathLiteral = ConvertTo-SharePointRestPathLiteral -ServerRelativePath $targetServerRelativePath
+    $addUrl = "$($siteUrl.TrimEnd('/'))/_api/web/GetFolderByServerRelativePath(decodedurl='$folderLiteral')/Files/AddTemplateFile(urlOfFile='$targetPathLiteral',templateFileType=3)"
+
+    Write-Log "Creating translated subfolder page with SharePoint REST: $targetServerRelativePath"
+    Invoke-SharePointRequestWithRetry -Uri $addUrl -Headers $headers -Method POST | Out-Null
+    Start-Sleep -Seconds 3
+
+    $sourceServerRelativePath = Get-ServerRelativePathFromWebUrl -WebUrl $Page.webUrl
+    $sourceItem = Get-SharePointFileListItemAllFieldsByPath -ServerRelativePath $sourceServerRelativePath
+    $sourceEditFields = Get-SharePointFileFieldValuesForEditByPath -ServerRelativePath $sourceServerRelativePath
+    $sourceFieldNames = @($sourceItem.PSObject.Properties.Name | Where-Object { $_ -match 'Canvas|Layout|Content|Banner|Description|Title' })
+    Write-Log "Source REST page fields available: $($sourceFieldNames -join ', ')"
+    Write-Log "Source ListItemAllFields CanvasContent1 length: $(([string]$sourceItem.CanvasContent1).Length)"
+    Write-Log "Source ListItemAllFields LayoutWebpartsContent length: $(([string]$sourceItem.LayoutWebpartsContent).Length)"
+    Write-Log "Source FieldValuesForEdit CanvasContent1 length: $(([string]$sourceEditFields.CanvasContent1).Length)"
+    Write-Log "Source FieldValuesForEdit LayoutWebpartsContent length: $(([string]$sourceEditFields.LayoutWebpartsContent).Length)"
+    $sourceCanvasJson = if (-not [string]::IsNullOrWhiteSpace([string]$sourceEditFields.CanvasContent1)) { [string]$sourceEditFields.CanvasContent1 } else { [string]$sourceItem.CanvasContent1 }
+    $sourceLayoutJson = if (-not [string]::IsNullOrWhiteSpace([string]$sourceEditFields.LayoutWebpartsContent)) { [string]$sourceEditFields.LayoutWebpartsContent } else { [string]$sourceItem.LayoutWebpartsContent }
+    $canvasContent = Translate-SharePointJsonField -Json $sourceCanvasJson -TextSegmentsTranslated $TextSegmentsTranslated
+    $layoutWebpartsContent = Translate-SharePointJsonField -Json $sourceLayoutJson -TextSegmentsTranslated $TextSegmentsTranslated
+    if ([string]::IsNullOrWhiteSpace($canvasContent)) {
+        Write-Log "Source CanvasContent1 was not available through REST. Falling back to Graph payload canvas conversion." -Level WARNING
+        $canvasContent = Convert-GraphPayloadToRestCanvasContent -Payload $payload
+        Write-Log "Generated fallback CanvasContent1 length: $(([string]$canvasContent).Length)"
+    }
+    if ([string]::IsNullOrWhiteSpace($layoutWebpartsContent)) {
+        $layoutWebpartsContent = New-LayoutWebpartsContent -Payload $payload
+        Write-Log "Generated fallback LayoutWebpartsContent length: $(([string]$layoutWebpartsContent).Length)"
+    }
+
+    $item = Get-SharePointFileListItemByPath -ServerRelativePath $targetServerRelativePath
+    $pathLiteral = ConvertTo-SharePointRestPathLiteral -ServerRelativePath $targetServerRelativePath
+    $itemUrl = "$($siteUrl.TrimEnd('/'))/_api/web/GetFileByServerRelativePath(decodedurl='$pathLiteral')/ListItemAllFields"
+    $mergeHeaders = New-SharePointHeaders
+    $mergeHeaders["IF-MATCH"] = "*"
+    $mergeHeaders["X-HTTP-Method"] = "MERGE"
+    $bodyObject = @{
+        Title                  = $targetTitle
+        CanvasContent1         = $canvasContent
+        LayoutWebpartsContent  = $layoutWebpartsContent
+        ClientSideApplicationId = "b6917cb1-93a0-4b97-a84d-7cf49975d4ec"
+        PageLayoutType         = "Article"
+        PromotedState          = 0
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$sourceItem.BannerImageUrl)) {
+        $bodyObject["BannerImageUrl"] = [string]$sourceItem.BannerImageUrl
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$sourceItem.Description)) {
+        $bodyObject["Description"] = Translate-Text -Text ([string]$sourceItem.Description) -TextType plain
+    }
+
+    $body = $bodyObject | ConvertTo-Json -Depth 100
+
+    Invoke-SharePointRequestWithRetry -Uri $itemUrl -Headers $mergeHeaders -Method POST -Body $body | Out-Null
+    try {
+        Save-SharePointSitePageByListItemId -ListItemId ([int]$item.Id) -Fields $bodyObject
+    }
+    catch {
+        Write-Log "Site Pages SavePage endpoint did not accept the payload: $($_.Exception.Message)" -Level WARNING
+    }
+
+    $targetItemAfterUpdate = Get-SharePointFileListItemAllFieldsByPath -ServerRelativePath $targetServerRelativePath
+    Write-Log "Target ListItemAllFields CanvasContent1 length after update: $(([string]$targetItemAfterUpdate.CanvasContent1).Length)"
+    Write-Log "Target ListItemAllFields LayoutWebpartsContent length after update: $(([string]$targetItemAfterUpdate.LayoutWebpartsContent).Length)"
+
+    if ([string]::IsNullOrWhiteSpace([string]$targetItemAfterUpdate.CanvasContent1)) {
+        Set-SharePointPageFieldsByValidateUpdate -ServerRelativePath $targetServerRelativePath -Fields @{
+            Title                   = $targetTitle
+            CanvasContent1          = $canvasContent
+            LayoutWebpartsContent   = $layoutWebpartsContent
+            ClientSideApplicationId = "b6917cb1-93a0-4b97-a84d-7cf49975d4ec"
+            PageLayoutType          = "Article"
+            PromotedState           = "0"
+        }
+
+        $targetItemAfterValidateUpdate = Get-SharePointFileListItemAllFieldsByPath -ServerRelativePath $targetServerRelativePath
+        Write-Log "Target ListItemAllFields CanvasContent1 length after ValidateUpdateListItem: $(([string]$targetItemAfterValidateUpdate.CanvasContent1).Length)"
+        Write-Log "Target ListItemAllFields LayoutWebpartsContent length after ValidateUpdateListItem: $(([string]$targetItemAfterValidateUpdate.LayoutWebpartsContent).Length)"
+    }
+
+    if ($Publish) {
+        Start-Sleep -Seconds 5
+        Publish-SharePointFileByPath -ServerRelativePath $targetServerRelativePath
+    }
+
+    $siteUri = [System.Uri]$siteUrl
+    return [PSCustomObject]@{
+        id     = $(if ($item.GUID) { ([string]$item.GUID).Trim('{}') } else { $Page.id })
+        name   = $TargetPageName
+        webUrl = "https://$($siteUri.Host)$targetServerRelativePath"
+    }
+}
+
+function Normalize-PageReferencePath {
+    param(
+        [string]$Reference
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Reference)) {
+        return ""
+    }
+
+    $referencePath = $Reference.Trim()
+    if ($referencePath -match '^https?://') {
+        $uri = [System.Uri]$referencePath
+        $referencePath = $uri.AbsolutePath
+    }
+
+    $referencePath = [System.Uri]::UnescapeDataString($referencePath).Replace('\', '/').Trim('/')
+    if ($referencePath -match '(?i)(?:^|/)SitePages/(.+)$') {
+        $referencePath = $matches[1]
+    }
+
+    return $referencePath.Trim('/')
+}
+
+function Get-PageFileNameFromReference {
+    param(
+        [string]$Reference
+    )
+
+    $normalizedPath = Normalize-PageReferencePath -Reference $Reference
+    if ([string]::IsNullOrWhiteSpace($normalizedPath)) {
+        return ""
+    }
+
+    return @($normalizedPath.Split('/'))[-1]
+}
+
+function Get-FolderPathFromPageReference {
+    param(
+        [string]$Reference
+    )
+
+    $normalizedPath = Normalize-PageReferencePath -Reference $Reference
+    $segments = @($normalizedPath.Split('/') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($segments.Count -le 1) {
+        return ""
+    }
+
+    return "/$($segments[0..($segments.Count - 2)] -join '/')"
+}
+
+function Get-SitePagesDriveId {
+    param(
+        [string]$SiteId
+    )
+
+    if ($script:sitePagesDriveIds.ContainsKey($SiteId)) {
+        return $script:sitePagesDriveIds[$SiteId]
+    }
+
+    $headers = New-GraphHeaders -MetadataNone
+    $drivesUrl = "https://graph.microsoft.com/v1.0/sites/$SiteId/drives?`$select=id,name,webUrl,driveType&`$top=200"
+    $drives = Get-GraphPagedResults -Uri $drivesUrl -Headers $headers
+    $sitePagesDrive = @($drives | Where-Object {
+            $_.name -eq "Site Pages" -or
+            $_.name -eq "SitePages" -or
+            $_.webUrl -match '/SitePages/?$'
+        } | Select-Object -First 1)
+
+    if ($sitePagesDrive.Count -gt 0) {
+        $script:sitePagesDriveIds[$SiteId] = $sitePagesDrive[0].id
+        Write-Log "Site Pages drive ID: $($sitePagesDrive[0].id)"
+        return $sitePagesDrive[0].id
+    }
+
+    $listsUrl = "https://graph.microsoft.com/v1.0/sites/$SiteId/lists?`$select=id,displayName,webUrl&`$top=200"
+    $lists = Get-GraphPagedResults -Uri $listsUrl -Headers $headers
+    $sitePagesList = @($lists | Where-Object {
+            $_.displayName -eq "Site Pages" -or
+            $_.displayName -eq "SitePages" -or
+            $_.webUrl -match '/SitePages/?$'
+        } | Select-Object -First 1)
+
+    if ($sitePagesList.Count -eq 0) {
+        $availableDrives = ($drives | ForEach-Object { "$($_.name) [$($_.webUrl)]" }) -join "; "
+        throw "Could not find the Site Pages library for site '$SiteId'. Available drives: $availableDrives"
+    }
+
+    $driveUrl = "https://graph.microsoft.com/v1.0/sites/$SiteId/lists/$($sitePagesList[0].id)/drive"
+    $drive = Invoke-GraphRequestWithRetry -Uri $driveUrl -Headers $headers -Method GET
+    $script:sitePagesDriveIds[$SiteId] = $drive.id
+    return $drive.id
+}
+
+function Get-SitePagesDriveItemByPath {
+    param(
+        [string]$SiteId,
+        [string]$RelativePath,
+        [switch]$IncludeListItem
+    )
+
+    $driveId = Get-SitePagesDriveId -SiteId $SiteId
+    $encodedPath = ConvertTo-GraphDrivePath -Path $RelativePath
+    if ([string]::IsNullOrWhiteSpace($encodedPath)) {
+        throw "A Site Pages drive relative path is required."
+    }
+
+    $expandQuery = ""
+    if ($IncludeListItem) {
+        $expandQuery = "?`$expand=listItem(`$expand=fields)"
+    }
+
+    $headers = New-GraphHeaders -MetadataNone
+    $itemUrl = "https://graph.microsoft.com/v1.0/drives/$driveId/root:/$($encodedPath):$expandQuery"
+    return Invoke-GraphRequestWithRetry -Uri $itemUrl -Headers $headers -Method GET
+}
+
+function Test-SitePagesDrivePathExists {
+    param(
+        [string]$SiteId,
+        [string]$RelativePath
+    )
+
+    try {
+        Get-SitePagesDriveItemByPath -SiteId $SiteId -RelativePath $RelativePath | Out-Null
+        return $true
+    }
+    catch {
+        $statusCode = $null
+        if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+        }
+
+        if ($statusCode -eq 404) {
+            return $false
+        }
+
+        throw
+    }
+}
+
+function Find-SitePagesDriveItemsByName {
+    param(
+        [string]$SiteId,
+        [string]$FileName
+    )
+
+    $driveId = Get-SitePagesDriveId -SiteId $SiteId
+    $headers = New-GraphHeaders -MetadataNone
+    $escapedFileName = $FileName.Replace("'", "''")
+    $searchUrl = "https://graph.microsoft.com/v1.0/drives/$driveId/root/search(q='$escapedFileName')?`$top=200"
+    $items = Get-GraphPagedResults -Uri $searchUrl -Headers $headers
+
+    return @($items | Where-Object {
+            $_.file -and
+            $_.name -eq $FileName -and
+            $_.name -like "*.aspx"
+        })
+}
+
+function Get-SitePagesDrivePageItems {
+    param(
+        [string]$SiteId,
+        [string]$FolderItemId = ""
+    )
+
+    $driveId = Get-SitePagesDriveId -SiteId $SiteId
+    $headers = New-GraphHeaders -MetadataNone
+    if ([string]::IsNullOrWhiteSpace($FolderItemId)) {
+        $childrenUrl = "https://graph.microsoft.com/v1.0/drives/$driveId/root/children?`$top=200"
+    }
+    else {
+        $childrenUrl = "https://graph.microsoft.com/v1.0/drives/$driveId/items/$FolderItemId/children?`$top=200"
+    }
+
+    $children = Get-GraphPagedResults -Uri $childrenUrl -Headers $headers
+    $pageItems = @()
+    foreach ($child in $children) {
+        if ($child.folder) {
+            $pageItems += Get-SitePagesDrivePageItems -SiteId $SiteId -FolderItemId $child.id
+        }
+        elseif ($child.file -and $child.name -like "*.aspx") {
+            $pageItems += $child
+        }
+    }
+
+    return $pageItems
+}
+
+function Convert-DriveItemToSitePageReference {
+    param(
+        [string]$SiteId,
+        [object]$DriveItem
+    )
+
+    if ($null -eq $DriveItem.listItem -or $null -eq $DriveItem.listItem.fields) {
+        $driveId = Get-SitePagesDriveId -SiteId $SiteId
+        $headers = New-GraphHeaders -MetadataNone
+        $itemUrl = "https://graph.microsoft.com/v1.0/drives/$driveId/items/$($DriveItem.id)?`$expand=listItem(`$expand=fields)"
+        $DriveItem = Invoke-GraphRequestWithRetry -Uri $itemUrl -Headers $headers -Method GET
+    }
+
+    $pageId = $DriveItem.sharepointIds.listItemUniqueId
+    if ([string]::IsNullOrWhiteSpace($pageId) -and $DriveItem.listItem.fields.UniqueId) {
+        $pageId = $DriveItem.listItem.fields.UniqueId
+    }
+
+    if ([string]::IsNullOrWhiteSpace($pageId)) {
+        throw "Could not resolve a site page ID for '$($DriveItem.webUrl)'."
+    }
+
+    return [PSCustomObject]@{
+        id     = $pageId
+        name   = $DriveItem.name
+        title  = $(if ($DriveItem.listItem.fields.Title) { $DriveItem.listItem.fields.Title } else { [System.IO.Path]::GetFileNameWithoutExtension($DriveItem.name) })
+        webUrl = $DriveItem.webUrl
+    }
+}
+
 function Resolve-PageReference {
     param(
+        [string]$SiteId,
         [array]$Pages,
         [string]$Reference
     )
@@ -783,27 +1863,54 @@ function Resolve-PageReference {
         return $Pages
     }
 
-    $candidate = $Reference
-    if ($Reference -match '^https?://') {
-        $candidate = [System.IO.Path]::GetFileName(([System.Uri]$Reference).AbsolutePath)
-    }
-
+    $candidate = Get-PageFileNameFromReference -Reference $Reference
     $candidateWithoutExtension = [System.IO.Path]::GetFileNameWithoutExtension($candidate)
+    $candidateFolderPath = Get-FolderPathFromPageReference -Reference $Reference
 
     $matches = @($Pages | Where-Object {
-            $_.name -eq $candidate -or
-            $_.name -eq "$candidate.aspx" -or
-            $_.title -eq $candidate -or
-            $_.title -eq $candidateWithoutExtension
+            $pageFolderPath = Get-FolderPathFromWebUrl -WebUrl $_.webUrl
+            $folderMatches = [string]::IsNullOrWhiteSpace($candidateFolderPath) -or
+                $pageFolderPath.Equals($candidateFolderPath, [System.StringComparison]::OrdinalIgnoreCase)
+
+            $folderMatches -and (
+                $_.name -eq $candidate -or
+                $_.name -eq "$candidate.aspx" -or
+                $_.title -eq $candidate -or
+                $_.title -eq $candidateWithoutExtension
+            )
         })
 
     if ($matches.Count -eq 0) {
         $matches = @($Pages | Where-Object {
-                $_.name -like $candidate -or
-                $_.title -like $candidate -or
-                $_.name -like "$candidateWithoutExtension.aspx" -or
-                $_.title -like $candidateWithoutExtension
+                $pageFolderPath = Get-FolderPathFromWebUrl -WebUrl $_.webUrl
+                $folderMatches = [string]::IsNullOrWhiteSpace($candidateFolderPath) -or
+                    $pageFolderPath.Equals($candidateFolderPath, [System.StringComparison]::OrdinalIgnoreCase)
+
+                $folderMatches -and (
+                    $_.name -like $candidate -or
+                    $_.title -like $candidate -or
+                    $_.name -like "$candidateWithoutExtension.aspx" -or
+                    $_.title -like $candidateWithoutExtension
+                )
             })
+    }
+
+    if ($matches.Count -eq 0) {
+        $candidateRelativePath = Normalize-PageReferencePath -Reference $Reference
+        if ($candidateRelativePath -match '/') {
+            $driveItem = Get-SitePagesDriveItemByPath -SiteId $SiteId -RelativePath $candidateRelativePath -IncludeListItem
+            return Convert-DriveItemToSitePageReference -SiteId $SiteId -DriveItem $driveItem
+        }
+
+        $driveMatches = @(Find-SitePagesDriveItemsByName -SiteId $SiteId -FileName $candidate)
+        if ($driveMatches.Count -eq 1) {
+            return Convert-DriveItemToSitePageReference -SiteId $SiteId -DriveItem $driveMatches[0]
+        }
+
+        if ($driveMatches.Count -gt 1) {
+            $names = ($driveMatches | ForEach-Object { "$($_.name) [$($_.webUrl)]" }) -join "; "
+            throw "Page reference '$Reference' matched multiple pages in Site Pages folders: $names"
+        }
     }
 
     if ($matches.Count -eq 0) {
@@ -918,10 +2025,56 @@ function Reset-WebPartIds {
     }
 }
 
+function Remove-EmptyNestedTitleProperties {
+    param(
+        [object]$Value,
+        [bool]$IsTopLevel = $false
+    )
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    if ($Value -is [array]) {
+        $cleanArray = @()
+        foreach ($item in $Value) {
+            $cleanArray += Remove-EmptyNestedTitleProperties -Value $item
+        }
+        return ,$cleanArray
+    }
+
+    if ($Value -is [System.Collections.IDictionary]) {
+        $cleanHash = [ordered]@{}
+        foreach ($key in $Value.Keys) {
+            if (-not $IsTopLevel -and $key -eq "title" -and [string]::IsNullOrWhiteSpace([string]($Value[$key]))) {
+                continue
+            }
+
+            $cleanHash[$key] = Remove-EmptyNestedTitleProperties -Value $Value[$key]
+        }
+        return $cleanHash
+    }
+
+    if ($Value -is [pscustomobject]) {
+        $cleanObject = [ordered]@{}
+        foreach ($property in $Value.PSObject.Properties) {
+            if (-not $IsTopLevel -and $property.Name -eq "title" -and [string]::IsNullOrWhiteSpace([string]($property.Value))) {
+                continue
+            }
+
+            $cleanObject[$property.Name] = Remove-EmptyNestedTitleProperties -Value $property.Value
+        }
+        return $cleanObject
+    }
+
+    return $Value
+}
+
 function Get-TranslatedPageName {
     param(
         [string]$SourceName,
-        [array]$ExistingPages
+        [array]$ExistingPages,
+        [string]$SourceFolderPath = ""
     )
 
     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($SourceName)
@@ -931,14 +2084,103 @@ function Get-TranslatedPageName {
     }
 
     $candidate = "$baseName$OutputNameSuffix$extension"
-    $existingNames = @($ExistingPages | ForEach-Object { $_.name })
+    $existingNames = @($ExistingPages | Where-Object {
+            $existingFolderPath = Get-FolderPathFromWebUrl -WebUrl $_.webUrl
+            if ([string]::IsNullOrWhiteSpace($SourceFolderPath)) {
+                [string]::IsNullOrWhiteSpace($existingFolderPath)
+            }
+            else {
+                $existingFolderPath.Equals($SourceFolderPath, [System.StringComparison]::OrdinalIgnoreCase)
+            }
+        } | ForEach-Object { $_.name })
+    
+    Write-Log "Checking for name conflicts. Looking for: '$candidate'" -Level INFO
+    Write-Log "Source page folder path: $(if ([string]::IsNullOrWhiteSpace($SourceFolderPath)) { '(root)' } else { $SourceFolderPath })" -Level INFO
 
     if ($existingNames -notcontains $candidate) {
+        Write-Log "Name '$candidate' is available" -Level INFO
         return $candidate
     }
 
+    # Name exists, generate a unique one with timestamp to avoid conflicts
+    Write-Log "Page name '$candidate' already exists. Generating unique name..." -Level WARNING
     $uniqueSuffix = Get-Date -Format "yyyyMMddHHmmss"
-    return "$baseName$OutputNameSuffix-$uniqueSuffix$extension"
+    $uniqueName = "$baseName$OutputNameSuffix-$uniqueSuffix$extension"
+    Write-Log "Using unique page name: $uniqueName" -Level INFO
+    return $uniqueName
+}
+
+function Get-FolderPathFromWebUrl {
+    param(
+        [string]$WebUrl
+    )
+
+    if ([string]::IsNullOrWhiteSpace($WebUrl)) {
+        return ""
+    }
+
+    $path = $WebUrl
+    if ($WebUrl -match '^https?://') {
+        $path = ([System.Uri]$WebUrl).AbsolutePath
+    }
+
+    $path = [System.Uri]::UnescapeDataString($path).Replace('\', '/')
+    if ($path -match '(?i)/SitePages/(.+)/[^/]+\.aspx$') {
+        return "/$($matches[1])"
+    }
+    
+    return ""
+}
+
+function Move-PageToFolder {
+    param(
+        [string]$SiteId,
+        [string]$PageName,
+        [string]$FolderPath,
+        [string]$TargetPageName = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($FolderPath) -or $FolderPath -eq "/") {
+        # Already at root, no move needed
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($TargetPageName)) {
+        $TargetPageName = $PageName
+    }
+
+    try {
+        Write-Log "Moving page '$PageName' to folder '$FolderPath' as '$TargetPageName'..."
+
+        $sourceServerRelativePath = Get-SitePagesFileServerRelativePath -FolderPath "" -PageName $PageName
+        $targetServerRelativePath = Get-SitePagesFileServerRelativePath -FolderPath $FolderPath -PageName $TargetPageName
+        $sourceLookupAttempts = 5
+        for ($attempt = 1; $attempt -le $sourceLookupAttempts; $attempt++) {
+            if (Test-SharePointFileExists -ServerRelativePath $sourceServerRelativePath) {
+                break
+            }
+
+            if ($attempt -lt $sourceLookupAttempts) {
+                Write-Log "Created page not yet discoverable at '$sourceServerRelativePath'. Retrying move lookup ($attempt/$sourceLookupAttempts)..." -Level WARNING
+                Start-Sleep -Seconds 2
+                continue
+            }
+
+            throw "Created page is not discoverable at '$sourceServerRelativePath'."
+        }
+
+        if (Test-SharePointFileExists -ServerRelativePath $targetServerRelativePath) {
+            throw "Target page already exists at '$targetServerRelativePath'."
+        }
+
+        $movedItem = Move-SharePointFile -SourceServerRelativePath $sourceServerRelativePath -TargetServerRelativePath $targetServerRelativePath
+        Write-Log "Successfully moved page to folder: $FolderPath" -Level SUCCESS
+        return $movedItem
+    }
+    catch {
+        Write-Log "Failed to move page to folder: $($_.Exception.Message)" -Level ERROR
+        throw
+    }
 }
 
 function New-TranslatedPagePayload {
@@ -948,8 +2190,20 @@ function New-TranslatedPagePayload {
         [ref]$TextSegmentsTranslated
     )
 
-    $translatedTitle = Translate-Text -Text $SourcePageContent.title -TextType plain
-    if ($translatedTitle -ne $SourcePageContent.title) {
+    # Handle empty or null titles
+    $sourceTitle = $SourcePageContent.title
+    if ([string]::IsNullOrWhiteSpace($sourceTitle)) {
+        $sourceTitle = [System.IO.Path]::GetFileNameWithoutExtension($SourcePageContent.name)
+        Write-Log "Source page title was empty. Using page name without extension: $sourceTitle" -Level WARNING
+    }
+
+    $translatedTitle = Translate-Text -Text $sourceTitle -TextType plain
+    if ([string]::IsNullOrWhiteSpace($translatedTitle)) {
+        Write-Log "Translated page title was empty. Falling back to source title: $sourceTitle" -Level WARNING
+        $translatedTitle = $sourceTitle
+    }
+
+    if ($translatedTitle -ne $sourceTitle) {
         $TextSegmentsTranslated.Value++
     }
 
@@ -1008,6 +2262,47 @@ function Get-CreatedSitePage {
     return Invoke-GraphRequestWithRetry -Uri $pageUrl -Headers $headers -Method GET
 }
 
+function Test-IsGraphNameConflict {
+    param(
+        [object]$ErrorRecord
+    )
+
+    if ($null -eq $ErrorRecord) {
+        return $false
+    }
+
+    $statusCode = $null
+    if ($ErrorRecord.Exception -and $ErrorRecord.Exception.Response -and $ErrorRecord.Exception.Response.StatusCode) {
+        $statusCode = [int]$ErrorRecord.Exception.Response.StatusCode
+    }
+
+    $message = [string]$ErrorRecord.Exception.Message
+    $details = [string]$ErrorRecord.ErrorDetails.Message
+    $combined = "$message`n$details"
+
+    if ($statusCode -eq 409 -and ($combined -match 'nameAlreadyExists' -or $combined -match 'Name already exists')) {
+        return $true
+    }
+
+    return $false
+}
+
+function New-RetryUniquePageName {
+    param(
+        [string]$CurrentName
+    )
+
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($CurrentName)
+    $extension = [System.IO.Path]::GetExtension($CurrentName)
+    if ([string]::IsNullOrWhiteSpace($extension)) {
+        $extension = ".aspx"
+    }
+
+    $stamp = Get-Date -Format "yyyyMMddHHmmssfff"
+    $randomPart = Get-Random -Minimum 100 -Maximum 999
+    return "$baseName-r$stamp$randomPart$extension"
+}
+
 #endregion
 
 #region Translation Flow
@@ -1030,7 +2325,19 @@ function Convert-SharePointPageToLanguage {
         Write-Log "Source page URL: $($Page.webUrl)"
 
         $sourceContent = Get-SitePageContent -SiteId $SiteId -PageId $Page.id
-        $targetPageName = Get-TranslatedPageName -SourceName $sourceContent.name -ExistingPages $ExistingPages
+        
+        # Extract the folder path from the source page URL FIRST, before naming
+        $sourceFolderPath = Get-FolderPathFromWebUrl -WebUrl $Page.webUrl
+        
+        # Now get the translated page name, considering the folder path
+        $targetPageName = Get-TranslatedPageName -SourceName $sourceContent.name -ExistingPages $ExistingPages -SourceFolderPath $sourceFolderPath
+        if ($sourceFolderPath) {
+            while (Test-SharePointFileExists -ServerRelativePath (Get-SitePagesFileServerRelativePath -FolderPath $sourceFolderPath -PageName $targetPageName)) {
+                $newPageName = New-RetryUniquePageName -CurrentName $targetPageName
+                Write-Log "Target page '$targetPageName' already exists in folder '$sourceFolderPath'. Retrying with '$newPageName'..." -Level WARNING
+                $targetPageName = $newPageName
+            }
+        }
         Write-Log "Target page name: $targetPageName"
 
         if ($sourceContent.canvasLayout -and $sourceContent.canvasLayout.horizontalSections) {
@@ -1043,13 +2350,52 @@ function Convert-SharePointPageToLanguage {
             }
         }
 
-        $payload = New-TranslatedPagePayload -SourcePageContent $sourceContent -NewPageName $targetPageName -TextSegmentsTranslated $textSegmentsRef
-        $body = $payload | ConvertTo-Json -Depth 100
-
-        Write-Log "Creating translated SharePoint page with Graph..."
+        $createdPage = $null
+        $targetWebUrl = ""
         $headers = New-GraphHeaders -MetadataNone
         $createUrl = "https://graph.microsoft.com/v1.0/sites/$SiteId/pages"
-        $createdPage = Invoke-GraphRequestWithRetry -Uri $createUrl -Headers $headers -Method POST -Body $body
+        $maxNameRetries = 5
+        $nameRetryCount = 0
+
+        if ($sourceFolderPath) {
+            $createdPage = New-RestSubfolderTranslatedPage -Page $Page -SourceContent $sourceContent `
+                -TargetPageName $targetPageName -TextSegmentsTranslated $textSegmentsRef -Publish:(-not $Draft)
+            $targetWebUrl = $createdPage.webUrl
+            $endTime = Get-Date
+            Add-TranslationResult -SourcePage $Page.name -SourceWebUrl $Page.webUrl -TargetPage $targetPageName `
+                -TargetWebUrl $targetWebUrl -Status "Success" -WebPartsProcessed $webPartsProcessed `
+                -TextSegmentsTranslated $textSegmentsRef.Value -StartTime $startTime -EndTime $endTime
+
+            Write-Log "Created translated REST subfolder page: $targetWebUrl" -Level SUCCESS
+            return $createdPage
+        }
+        else {
+            $payload = New-TranslatedPagePayload -SourcePageContent $sourceContent -NewPageName $targetPageName `
+                -TextSegmentsTranslated $textSegmentsRef
+
+            Write-Log "Creating translated SharePoint page with Graph..."
+            while ($true) {
+                try {
+                    $body = $payload | ConvertTo-Json -Depth 100
+                    $createdPage = Invoke-GraphRequestWithRetry -Uri $createUrl -Headers $headers -Method POST -Body $body
+                    break
+                }
+                catch {
+                    if ((Test-IsGraphNameConflict -ErrorRecord $_) -and $nameRetryCount -lt $maxNameRetries) {
+                        $nameRetryCount++
+                        $newPageName = New-RetryUniquePageName -CurrentName $targetPageName
+                        Write-Log "Target page name '$targetPageName' already exists. Retrying with '$newPageName' ($nameRetryCount/$maxNameRetries)..." -Level WARNING
+                        $targetPageName = $newPageName
+                        $payload['name'] = $targetPageName
+                        continue
+                    }
+
+                    throw
+                }
+            }
+
+            $targetWebUrl = $createdPage.webUrl
+        }
 
         if (-not $Draft) {
             Write-Log "Publishing translated page..."
@@ -1068,10 +2414,10 @@ function Convert-SharePointPageToLanguage {
 
         $endTime = Get-Date
         Add-TranslationResult -SourcePage $Page.name -SourceWebUrl $Page.webUrl -TargetPage $targetPageName `
-            -TargetWebUrl $createdPage.webUrl -Status "Success" -WebPartsProcessed $webPartsProcessed `
+            -TargetWebUrl $targetWebUrl -Status "Success" -WebPartsProcessed $webPartsProcessed `
             -TextSegmentsTranslated $textSegmentsRef.Value -StartTime $startTime -EndTime $endTime
 
-        Write-Log "Created translated page: $($createdPage.webUrl)" -Level SUCCESS
+        Write-Log "Created translated page: $targetWebUrl" -Level SUCCESS
         return $createdPage
     }
     catch {
@@ -1101,7 +2447,7 @@ function Start-PageTranslation {
     $allPages = Get-AllSitePages -SiteId $siteId
     Write-Log "Found $($allPages.Count) ASPX page(s) in Site Pages."
 
-    $pagesToTranslate = @(Resolve-PageReference -Pages $allPages -Reference $PageName)
+    $pagesToTranslate = @(Resolve-PageReference -SiteId $siteId -Pages $allPages -Reference $PageName)
     Write-Log "Pages selected for translation: $($pagesToTranslate.Count)"
 
     $successCount = 0
@@ -1140,6 +2486,9 @@ Write-Log "Target Language: $TargetLanguage" -Level INFO
 Write-Log "Output Name Suffix: $OutputNameSuffix" -Level INFO
 Write-Log "App Auth Mode: $AppAuthMode" -Level INFO
 Write-Log "Translator Auth Mode: $TranslatorAuthMode" -Level INFO
+if ($TranslatorAuthMode -eq 'Entra') {
+    Write-Log "Translator Token Tenant: $(Get-EffectiveTranslatorTenantId)" -Level INFO
+}
 Write-Log "Publish After Create: $(-not $Draft.IsPresent)" -Level INFO
 Write-Log "Log File: $logFile" -Level INFO
 Write-Log "CSV Report: $csvLog" -Level INFO
