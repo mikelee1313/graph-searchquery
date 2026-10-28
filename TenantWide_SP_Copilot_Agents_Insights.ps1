@@ -7,6 +7,8 @@
     across a Microsoft 365 tenant and generates a CSV inventory with information about each
     discovered agent and its host site. Microsoft Graph is used for discovery; PnP PowerShell
     retrieves additional site information.
+    Configured geographic locations are discovered automatically and searched in one run,
+    producing a combined CSV inventory without separate runs for each geo.
 
     Information collected includes:
     - Agent details (name, library name, created date, last modified date, creator)
@@ -47,7 +49,8 @@
     The Microsoft 365 tenant ID
 
 .PARAMETER searchRegion
-    The region for Microsoft Graph search (NAM, EMEA, APAC, etc.)
+    Optional preferred region to probe for single-geo tenants (for example NAM, EUR, APC).
+    Leave empty for automatic detection. Multi-Geo locations are discovered automatically.
 
 .NOTES
     File Name      : TenantWide_SP_Copilot_Agents_Insights.ps1
@@ -76,7 +79,8 @@
        - In Entra ID > App registrations > your app > API permissions, add the Graph
          permission under Microsoft Graph, and the SharePoint permission under SharePoint.
          Grant tenant-wide admin consent for BOTH resources using an authorized administrator.
-       - Graph Sites.Read.All authorizes POST /v1.0/search/query for driveItem discovery.
+       - Graph Sites.Read.All authorizes GET /v1.0/sites for geo discovery and
+         POST /v1.0/search/query for driveItem discovery.
          The library-name lookup also calls GET /v1.0/drives/{drive-id}?$select=name.
        - SharePoint Sites.FullControl.All supports access to the tenant administration
          API used by Get-PnPTenantSite and the site CSOM calls used by Get-PnPWeb and
@@ -108,9 +112,14 @@
          using the same app and certificate. The tokens are not interchangeable.
 
     4. Search coverage and interpretation
-       - Set $searchRegion to the tenant's applicable Graph search data-location code.
-         Each app-only search covers one geographic region; for Multi-Geo, run separately
-         for every applicable region and consolidate the inventories.
+       - Geo root sites are discovered through Microsoft Graph, including paged results.
+         Each discovered data-location code is validated before searching. Single-geo
+         tenants without a data-location code use automatic region probing; $searchRegion
+         is an optional preferred candidate, not a limit on Multi-Geo discovery.
+       - All discovered regions are searched in one run and combined in one CSV, with
+         duplicate agent URLs removed. PnP tenant queries target each site's geo admin
+         center. Discovery or region-validation failures stop the run rather than
+         silently substituting another geo or reporting incomplete discovery as complete.
        - The query requests shared and private content. Initial private-content indexing
          can take days or longer; early runs may omit private OneDrive agents.
        - Review the log for permission failures, missing library names, and skipped sites.
@@ -156,6 +165,12 @@ to use the sample scripts or documentation, even if Microsoft has been advised o
 
 .LINK
     https://pnp.github.io/powershell/articles/authentication.html
+
+.LINK
+    https://learn.microsoft.com/sharepoint/dev/solution-guidance/multigeo-discovery
+
+.LINK
+    https://github.com/mikelee1313/SPO-Sharing-Scripts/blob/main/Get-and-Remove-SPOSharingLinks.ps1
 #>
 
 
@@ -167,7 +182,7 @@ $tenantname = "M365CPI13246019"                                   # This is your
 $appID = "abc64618-283f-47ba-a185-50d935d51d57"                 # This is your Entra App ID
 $thumbprint = "B696FDCFE1453F3FBC6031F54DE988DA0ED905A9"        # This is certificate thumbprint
 $tenantid = "9cfc42cb-51da-4055-87e9-b20a170b6ba3"                # This is your Tenant ID
-$searchRegion = "NAM"                                          # Region for Microsoft Graph search
+$searchRegion = ""                                             # Optional preferred single-geo region; empty = auto-detect
 
 
 # Script Variables
@@ -364,6 +379,112 @@ Function Invoke-PnPWithRetry {
 }
 #endregion
 
+#region Geo discovery and Graph search region detection
+function Test-GraphSearchRegion {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string] $Region
+    )
+
+    $payload = @{
+        requests = @(@{
+            entityTypes = @("driveItem")
+            query = @{ queryString = "filetype:agent" }
+            from = 0
+            size = 1
+            sharePointOneDriveOptions = @{ includeContent = "sharedContent" }
+            region = $Region
+        })
+    } | ConvertTo-Json -Depth 5
+
+    try {
+        Invoke-RestMethod -Method POST -Uri "https://graph.microsoft.com/v1.0/search/query" `
+            -Headers @{ Authorization = "Bearer $global:graphToken" } `
+            -Body $payload -ContentType "application/json" -ErrorAction Stop | Out-Null
+        return $true
+    }
+    catch {
+        $statusCode = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+        $details = "$($_.ErrorDetails.Message) $($_.Exception.Message)"
+        if ($statusCode -eq 400 -and $details -match '(?i)region|geograph|data.?location') {
+            Write-LogEntry -LogName $logPath -LogEntryText "Graph search rejected region '$Region': $details" -LogLevel "WARNING"
+            return $false
+        }
+        Write-LogEntry -LogName $logPath -LogEntryText "Graph search region probe failed for '$Region': $_" -LogLevel "ERROR"
+        throw
+    }
+}
+
+function Get-GraphSearchRegions {
+    $geoCodes = @{}
+    $rootCount = 0
+    $missingGeoCode = $false
+    $nextUrl = 'https://graph.microsoft.com/v1.0/sites?$filter=siteCollection/root ne null&$select=webUrl,siteCollection'
+
+    do {
+        $page = Invoke-RestMethod -Method GET -Uri $nextUrl `
+            -Headers @{ Authorization = "Bearer $global:graphToken" } -ErrorAction Stop
+        foreach ($rootSite in $page.value) {
+            $rootCount++
+            $geoCode = $rootSite.siteCollection.dataLocationCode
+            if ([string]::IsNullOrWhiteSpace($geoCode)) {
+                $missingGeoCode = $true
+            }
+            else {
+                $geoCodes[$geoCode.Trim().ToUpperInvariant()] = $true
+            }
+            Write-LogEntry -LogName $logPath -LogEntryText "Discovered geo root '$($rootSite.webUrl)' with data-location code '$geoCode'." -LogLevel "INFO"
+        }
+        $nextUrl = $page.'@odata.nextLink'
+    } while ($nextUrl)
+
+    if ($rootCount -eq 0) {
+        throw "Graph geo discovery returned no root sites. Check Graph Sites.Read.All and admin consent."
+    }
+    if ($missingGeoCode -and $rootCount -gt 1) {
+        throw "Graph discovered multiple geo roots but at least one has no data-location code. Cannot guarantee complete geo coverage."
+    }
+
+    $regions = @{}
+    if ($geoCodes.Count -gt 0) {
+        foreach ($geoCode in ($geoCodes.Keys | Sort-Object)) {
+            $resolvedRegion = $geoCode
+            if (-not (Test-GraphSearchRegion -Region $resolvedRegion)) {
+                if ($geoCode -eq "NAM" -and (Test-GraphSearchRegion -Region "US")) {
+                    $resolvedRegion = "US"
+                }
+                else {
+                    throw "Cannot validate Graph search for discovered geo '$geoCode'. No alternate geo will be substituted."
+                }
+            }
+            $regions[$resolvedRegion] = $true
+        }
+    }
+    else {
+        # Single-geo tenants may not expose dataLocationCode.
+        $candidates = @($searchRegion) + @(
+            "NAM", "US", "EUR", "APC", "GBR", "CAN", "IND", "AUS", "JPN", "DEU",
+            "ZAF", "ARE", "CHE", "NOR", "KOR", "SWE", "TWN", "FRA", "ITA", "MEX",
+            "LAM", "NZL", "SGP", "BRA", "MYS", "QAT", "POL"
+        )
+        foreach ($candidate in ($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+            if (Test-GraphSearchRegion -Region $candidate) {
+                $regions[$candidate] = $true
+                break
+            }
+        }
+        if ($regions.Count -eq 0) {
+            throw "Could not detect a working Graph search region. Set searchRegion to the tenant's data-location code and retry."
+        }
+    }
+
+    $resolvedRegions = @($regions.Keys | Sort-Object)
+    Write-Host "Discovered Graph search regions: $($resolvedRegions -join ', ')" -ForegroundColor Cyan
+    Write-LogEntry -LogName $logPath -LogEntryText "Discovered Graph search regions: $($resolvedRegions -join ', ')" -LogLevel "INFO"
+    return $resolvedRegions
+}
+#endregion
+
 #region SharePoint site information
 # Function to get SharePoint site information using PnP PowerShell
 Function Get-PnPSiteInformation {
@@ -412,9 +533,11 @@ Function Get-PnPSiteInformation {
         # Connect to the site using PnP
         Write-LogEntry -LogName $logPath -LogEntryText "Connecting to site: $SiteUrl" -LogLevel "INFO"
         
-        # First connect to the admin center to get tenant-level site properties
+        # Tenant CSOM calls must target the admin center of the site's own geo.
+        $siteHost = ([System.Uri]$SiteUrl).Host -replace '-my\.sharepoint\.com$', '.sharepoint.com'
+        $siteAdminUrl = "https://$($siteHost -replace '\.sharepoint\.com$', '-admin.sharepoint.com')"
         Invoke-PnPWithRetry -ScriptBlock { 
-            Connect-PnPOnline -Url $adminUrl @pnpConnectionParams -ErrorAction Stop 
+            Connect-PnPOnline -Url $siteAdminUrl @pnpConnectionParams -ErrorAction Stop 
         } -Operation "Connect to SharePoint Admin Center" -LogName $logPath
         
         # Get tenant site properties consistently for all sites (SharePoint and OneDrive)
@@ -572,13 +695,18 @@ Function Get-PnPSiteInformation {
 #region Copilot agent discovery
 # Function to search for Copilot agents using Microsoft Graph API
 function Search-CopilotAgents {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string] $Region
+    )
+
     # Display search query information
-    Write-Host -ForegroundColor Green "Performing Search for All SharePoint Copilot Agents";
-    Write-LogEntry -LogName $logPath -LogEntryText "Performing Search for All SharePoint Copilot Agents" -LogLevel "INFO"
+    Write-Host -ForegroundColor Green "Performing search for SharePoint Copilot agents in region: $Region";
+    Write-LogEntry -LogName $logPath -LogEntryText "Performing search for SharePoint Copilot agents in region: $Region" -LogLevel "INFO"
     
     # Ensure we have a valid token
     if (-not $global:graphToken) {
-        Get-GraphAccessToken
+        Get-GraphAccessToken | Out-Null
     }
     
     # Define the authorization header
@@ -605,14 +733,14 @@ function Search-CopilotAgents {
                         "driveItem"
                     ],
                     "query": {
-                        "queryString": "filetype:agent",
+                        "queryString": "filetype:agent"
                     },
                     "from": $start,
                     "size": $size,
                     "sharePointOneDriveOptions": {
                         "includeContent": "sharedContent,privateContent"
                     },
-                    "region": "$searchRegion"
+                    "region": "$Region"
                 }
             ]
         }
@@ -705,7 +833,7 @@ function Search-CopilotAgents {
             if ($_.Exception.Message -like "*token has expired*" -or $_.Exception.Message -like "*Authentication failed*") {
                 Write-Host -ForegroundColor Yellow "Token expired. Refreshing token and retrying..."
                 Write-LogEntry -LogName $logPath -LogEntryText "Token expired. Refreshing token and retrying..." -LogLevel "WARNING"
-                Get-GraphAccessToken
+                Get-GraphAccessToken | Out-Null
                 $headers = @{"Authorization" = "Bearer $global:graphToken" };
             }
             else {
@@ -714,8 +842,8 @@ function Search-CopilotAgents {
         }
     }
 
-    Write-Host -ForegroundColor Green "Search Completed Successfully. Found $agentCount Copilot agents across $($sites.Count) sites.";
-    Write-LogEntry -LogName $logPath -LogEntryText "Search completed successfully. Found $agentCount Copilot agents across $($sites.Count) sites." -LogLevel "INFO"
+    Write-Host -ForegroundColor Green "Search completed for region $Region. Found $agentCount Copilot agents across $($sites.Count) sites.";
+    Write-LogEntry -LogName $logPath -LogEntryText "Search completed for region $Region. Found $agentCount Copilot agents across $($sites.Count) sites." -LogLevel "INFO"
     
     return $sites
 }
@@ -845,7 +973,7 @@ try {
     Write-Host "Admin URL: $adminUrl" -ForegroundColor Yellow
     Write-Host "Tenant ID: $TenantId" -ForegroundColor Yellow
     Write-Host "Application ID: $AppId" -ForegroundColor Yellow
-    Write-Host "Search Region: $searchRegion" -ForegroundColor Yellow
+    Write-Host "Geo discovery: Automatic (all configured geos)" -ForegroundColor Yellow
     Write-Host "Output File: $outputPath" -ForegroundColor Yellow
     Write-Host "Log File: $logPath" -ForegroundColor Yellow
     Write-Host "============================================================" -ForegroundColor Cyan
@@ -854,10 +982,27 @@ try {
     Test-AndInstallModule -ModuleName "PnP.PowerShell"
     
     # Get Microsoft Graph token
-    Get-GraphAccessToken
+    Get-GraphAccessToken | Out-Null
     
-    # Search for Copilot agents
-    $sites = Search-CopilotAgents
+    $searchRegions = @(Get-GraphSearchRegions)
+    $sites = @{}
+    $agentUrls = @{}
+    foreach ($region in $searchRegions) {
+        Write-Host "Searching for Copilot agents in region: $region" -ForegroundColor Cyan
+        Write-LogEntry -LogName $logPath -LogEntryText "Searching for Copilot agents in region: $region" -LogLevel "INFO"
+        $regionSites = Search-CopilotAgents -Region $region
+        foreach ($siteUrl in $regionSites.Keys) {
+            if (-not $sites.ContainsKey($siteUrl)) {
+                $sites[$siteUrl] = @()
+            }
+            foreach ($agent in $regionSites[$siteUrl]) {
+                if (-not $agentUrls.ContainsKey($agent.WebUrl)) {
+                    $agentUrls[$agent.WebUrl] = $true
+                    $sites[$siteUrl] += $agent
+                }
+            }
+        }
+    }
     
     if ($sites.Count -eq 0) {
         Write-Host "No Copilot agents found in the tenant." -ForegroundColor Yellow
