@@ -1,17 +1,38 @@
 <#
 .SYNOPSIS
-    Discovers and documents all SharePoint Copilot Agents across a Microsoft 365 tenant.
+    Inventories discoverable legacy SharePoint and OneDrive agent files across a Microsoft 365 tenant.
 
 .DESCRIPTION
-    This script searches for SharePoint Copilot Agents across an entire Microsoft 365 tenant and 
-    generates a comprehensive report with detailed information about each agent and its host site.
-    The script utilizes Microsoft Graph API to search for Copilot agents and PnP PowerShell to 
-    retrieve detailed site information.
+    This script searches Microsoft Graph for SharePoint and OneDrive agent files (filetype:agent)
+    across a Microsoft 365 tenant and generates a CSV inventory with information about each
+    discovered agent and its host site. Microsoft Graph is used for discovery; PnP PowerShell
+    retrieves additional site information.
 
     Information collected includes:
-    - Copilot agent details (name, created date, last accessed date, owner)
-    - Site information (template, owner, sensitivity label)
+    - Agent details (name, library name, created date, last modified date, creator)
+    - Host site information (URL, site name, template, owner, sensitivity label)
     - Security settings (information barriers, external sharing, site access restrictions)
+
+    This inventory supports review and migration planning for Microsoft 365 Message Center
+    announcement MC1511052. It reports agents discoverable by the Graph search query; it is not
+    a definitive inventory of every agent type in the tenant. In particular, it searches for
+    legacy .agent files and does not enumerate agents created in Copilot Agent Builder or the
+    Microsoft 365 agent catalog. Search region, Graph indexing, permissions, and sharing/search
+    visibility may affect the results. Validate coverage and ownership with site owners and
+    Microsoft 365 administration before making migration decisions.
+
+    For each discovered agent, review whether it is still needed, who owns and uses it, where it
+    is surfaced or shared, and whether it should be upgraded, converted, or retired. Keep this
+    CSV as a point-in-time planning inventory; rerun it as the transition progresses.
+
+.NOTES
+    MC1511052: "Upcoming changes to Agents in SharePoint and OneDrive" describes the transition
+    from SharePoint/OneDrive .agent files to Microsoft Copilot Agent Builder. The announcement
+    states that creation of new .agent files will stop beginning in mid-November 2026; existing
+    .agent files are expected to continue working through March 2027, with retirement beginning
+    in April 2027. Microsoft indicates that existing agents will not be migrated automatically.
+    Plan to upgrade, convert, or retire each agent and validate the current dates and guidance
+    in your tenant's Message Center, as rollout schedules can change.
 
 .PARAMETER tenantname
     The name of your Microsoft 365 tenant (without .onmicrosoft.com)
@@ -32,9 +53,72 @@
     File Name      : TenantWide_SP_Copilot_Agents_Insights.ps1
     Author         : Mike Lee
     Date Created   : 7/7/2025
-    Prerequisite   : PnP.PowerShell module
-                     Entra App with Sites.FullControl.All and Sites.Read.All permissions
-                     Certificate-based authentication configured
+    Updated        : 10/28/2026
+    Prerequisites (for the script as written):
+
+    1. Runtime and connectivity
+       - Run on Windows in PowerShell 7 with a compatible PnP.PowerShell release.
+         Current stable PnP.PowerShell requires PowerShell 7.4 or later.
+       - Install PnP.PowerShell before running, or allow the script to install it for
+         CurrentUser from PowerShell Gallery when it is missing.
+       - Allow HTTPS access to Microsoft Entra authentication, Microsoft Graph, the
+         tenant's SharePoint admin center, and the SharePoint/OneDrive sites being queried.
+       - The account running the script must be able to write CSV and log files to $env:TEMP.
+
+    2. Entra application registration and API permissions
+       Configure BOTH of the following on the SAME application identified by $appID:
+
+       API resource       Permission type   Permission              Used by
+       -----------------  ----------------  ----------------------  ---------------------------
+       Microsoft Graph    Application       Sites.Read.All          Graph search and discovery
+       SharePoint         Application       Sites.FullControl.All   PnP tenant/site CSOM calls
+
+       - In Entra ID > App registrations > your app > API permissions, add the Graph
+         permission under Microsoft Graph, and the SharePoint permission under SharePoint.
+         Grant tenant-wide admin consent for BOTH resources using an authorized administrator.
+       - Graph Sites.Read.All authorizes POST /v1.0/search/query for driveItem discovery.
+         The library-name lookup also calls GET /v1.0/drives/{drive-id}?$select=name.
+       - SharePoint Sites.FullControl.All supports access to the tenant administration
+         API used by Get-PnPTenantSite and the site CSOM calls used by Get-PnPWeb and
+         Get-PnPSiteCollectionAdmin. This is a powerful tenant-wide grant even though
+         this script only reads data; approve and protect it accordingly.
+       - These are APPLICATION permissions, not delegated permissions. A signed-in
+         user's SharePoint Administrator role does not replace these app-only grants.
+       - Graph and SharePoint permissions are separate: granting Sites.FullControl.All
+         on Microsoft Graph does not grant access to SharePoint CSOM, and granting it
+         on SharePoint does not authorize Microsoft Graph search.
+       - Sites.Selected is not a drop-in replacement for this tenant-wide search and
+         tenant-administration workflow. No Graph write or directory permissions are
+         requested by this script.
+
+    3. Certificate-based app-only authentication
+       - Upload the certificate's public key (.cer) to the same Entra app registration.
+       - Install the matching, unexpired RSA certificate WITH its private key in
+         Cert:\LocalMachine\My on the Windows computer running the script.
+         Get-GraphAccessToken explicitly reads this store; CurrentUser alone is not enough.
+       - Grant the executing account read access to that private key. The certificate
+         must be resolvable by Connect-PnPOnline -Thumbprint as well.
+       - The current Graph signing code uses certificate.PrivateKey.SignData; use an
+         RSA key/provider compatible with this implementation.
+       - Set $tenantname, $tenantid, $appID, and $thumbprint to the matching tenant/app/
+         certificate values. Client-secret, interactive, and managed-identity
+         authentication are not implemented by this script.
+       - Graph requests use a Graph access token obtained with
+         https://graph.microsoft.com/.default; PnP obtains a separate SharePoint token
+         using the same app and certificate. The tokens are not interchangeable.
+
+    4. Search coverage and interpretation
+       - Set $searchRegion to the tenant's applicable Graph search data-location code.
+         Each app-only search covers one geographic region; for Multi-Geo, run separately
+         for every applicable region and consolidate the inventories.
+       - The query requests shared and private content. Initial private-content indexing
+         can take days or longer; early runs may omit private OneDrive agents.
+       - Review the log for permission failures, missing library names, and skipped sites.
+         A partial or empty report is not proof that no agents exist.
+       - The LastAccessedDate CSV column currently contains lastModifiedDateTime (or
+         site LastContentModifiedDate as a fallback), NOT actual agent usage/access.
+         The Owner column uses the creator display name when available, not a verified
+         current business owner. Confirm ownership and usage before retiring an agent.
 
 .Disclaimer: 
 The sample scripts are provided AS IS without warranty of any kind. 
@@ -51,21 +135,38 @@ to use the sample scripts or documentation, even if Microsoft has been advised o
     .\TenantWide_SP_Copilot_Agents_Insights.ps1
 
 .OUTPUTS
-    - CSV file with all Copilot agents and their site information
+    - Point-in-time CSV inventory of discovered SharePoint/OneDrive .agent files and site information
     - Log file with detailed script execution information
 
 .LINK
     https://learn.microsoft.com/microsoft-365-copilot/
+    https://mc.merill.net/message/MC1511052
+
+.LINK
+    https://learn.microsoft.com/graph/api/search-query
+
+.LINK
+    https://learn.microsoft.com/graph/search-concept-searchall
+
+.LINK
+    https://learn.microsoft.com/sharepoint/dev/solution-guidance/security-apponly-azuread
+
+.LINK
+    https://pnp.github.io/powershell/cmdlets/Get-PnPTenantSite.html
+
+.LINK
+    https://pnp.github.io/powershell/articles/authentication.html
 #>
 
 
+#region Configuration and output setup
 # ----------------------------------------------
 # Set Variables
 # ----------------------------------------------
-$tenantname = "m365x61250205"                                   # This is your tenant name
-$appID = "5baa1427-1e90-4501-831d-a8e67465f0d9"                 # This is your Entra App ID
+$tenantname = "M365CPI13246019"                                   # This is your tenant name
+$appID = "abc64618-283f-47ba-a185-50d935d51d57"                 # This is your Entra App ID
 $thumbprint = "B696FDCFE1453F3FBC6031F54DE988DA0ED905A9"        # This is certificate thumbprint
-$tenantid = "85612ccb-4c28-4a34-88df-a538cc139a51"                # This is your Tenant ID
+$tenantid = "9cfc42cb-51da-4055-87e9-b20a170b6ba3"                # This is your Tenant ID
 $searchRegion = "NAM"                                          # Region for Microsoft Graph search
 
 
@@ -90,13 +191,16 @@ $global:graphToken = $null
 $global:Results = @()
 
 # Define the fields for the CSV file
-$csvHeaders = "WebURL,Copilot Name,CreatedDate,LastAccessedDate,Owner,Site Name,Template,Site Owner,Sensitivity," + 
+$csvHeaders = "WebURL,Copilot Name,Library Name,CreatedDate,LastAccessedDate,Owner,Site Name,Template,Site Owner,Sensitivity," + 
 "Restrict Site Access Enabled,Restrict Site Discovery Enabled,External Sharing," + 
 "Information Barrier Mode,Information Barrier Segments"
 
 # Create the CSV file with headers
 $csvHeaders | Out-File -FilePath $outputPath -Encoding UTF8 -Force
 
+#endregion
+
+#region Logging
 # Function to write log entries
 Function Write-LogEntry {
     param(
@@ -109,7 +213,9 @@ Function Write-LogEntry {
         "$([DateTime]::Now.ToShortDateString()) $([DateTime]::Now.ToShortTimeString()) : [$LogLevel] $LogEntryText" | Out-File -FilePath $LogName -Append
     }
 }
+#endregion
 
+#region Graph authentication
 # Function to authenticate with Microsoft Graph API and retrieve an access token
 function Get-GraphAccessToken {
     try {
@@ -173,7 +279,8 @@ function Get-GraphAccessToken {
         $global:graphToken = $loginResponse.access_token
         Write-LogEntry -LogName $logPath -LogEntryText "Successfully authenticated with Microsoft Graph API using certificate." -LogLevel "INFO"
         Write-Host -ForegroundColor Green "Successfully authenticated with Microsoft Graph API using certificate."
-        return $global:graphToken
+        #Only needed for debugging
+        #return $global:graphToken
     }
     catch {
         Write-LogEntry -LogName $logPath -LogEntryText "Authentication failed with Microsoft Graph API: $_" -LogLevel "ERROR"
@@ -181,7 +288,9 @@ function Get-GraphAccessToken {
         throw
     }
 }
+#endregion
 
+#region PnP retry handling
 # Function to handle throttling with exponential backoff for PnP cmdlets
 Function Invoke-PnPWithRetry {
     param (
@@ -253,7 +362,9 @@ Function Invoke-PnPWithRetry {
         }
     } while (-not $success -and $retryCount -lt $MaxRetries)
 }
+#endregion
 
+#region SharePoint site information
 # Function to get SharePoint site information using PnP PowerShell
 Function Get-PnPSiteInformation {
     param (
@@ -456,7 +567,9 @@ Function Get-PnPSiteInformation {
         }
     }
 }
+#endregion
 
+#region Copilot agent discovery
 # Function to search for Copilot agents using Microsoft Graph API
 function Search-CopilotAgents {
     # Display search query information
@@ -479,6 +592,7 @@ function Search-CopilotAgents {
     $i = 0;
     $agentCount = 0;
     $sites = @{}  # Hashtable to store unique sites
+    $driveNames = @{}
 
     # Loop to handle pagination
     while ($moreresults) {
@@ -522,6 +636,29 @@ function Search-CopilotAgents {
                         if ($resource) {
                             # Extract site URL from webUrl
                             $webUrl = $resource.webUrl
+                            $libraryName = ""
+                            $driveId = $resource.parentReference.driveId
+
+                            if (-not [string]::IsNullOrEmpty($driveId)) {
+                                if (-not $driveNames.ContainsKey($driveId)) {
+                                    try {
+                                        $encodedDriveId = [System.Uri]::EscapeDataString($driveId)
+                                        $drive = Invoke-RestMethod -Method GET -Uri "https://graph.microsoft.com/v1.0/drives/$encodedDriveId`?`$select=name" -Headers $headers
+                                        if ([string]::IsNullOrEmpty($drive.name)) {
+                                            throw "Microsoft Graph returned no drive name for drive ID $driveId."
+                                        }
+                                        $driveNames[$driveId] = $drive.name
+                                    }
+                                    catch {
+                                        $driveNames[$driveId] = ""
+                                        Write-LogEntry -LogName $logPath -LogEntryText "Could not retrieve library name for drive ID $driveId : $_" -LogLevel "WARNING"
+                                    }
+                                }
+                                $libraryName = $driveNames[$driveId]
+                            }
+                            else {
+                                Write-LogEntry -LogName $logPath -LogEntryText "Search result for '$($resource.name)' did not include a drive ID; library name could not be determined." -LogLevel "WARNING"
+                            }
                             
                             # Get the site URL using the helper function
                             $siteUrl = Get-SiteUrlFromWebUrl -WebUrl $webUrl
@@ -537,6 +674,7 @@ function Search-CopilotAgents {
                                 $agentInfo = @{
                                     Name                 = $resource.name
                                     WebUrl               = $webUrl
+                                    LibraryName          = $libraryName
                                     CreatedDateTime      = if ($resource.createdDateTime) { [DateTime]$resource.createdDateTime } else { $null }
                                     LastModifiedDateTime = if ($resource.lastModifiedDateTime) { [DateTime]$resource.lastModifiedDateTime } else { $null }
                                     CreatedBy            = if ($resource.createdBy.user.displayName) { $resource.createdBy.user.displayName } else { "" }
@@ -581,7 +719,9 @@ function Search-CopilotAgents {
     
     return $sites
 }
+#endregion
 
+#region SharePoint URL parsing
 # Function to handle site URL parsing from web URL
 function Get-SiteUrlFromWebUrl {
     param (
@@ -626,7 +766,9 @@ function Get-SiteUrlFromWebUrl {
         return ""
     }
 }
+#endregion
 
+#region Module management
 # Function to check if a module is installed and install if not
 Function Test-AndInstallModule {
     param (
@@ -649,7 +791,9 @@ Function Test-AndInstallModule {
         throw $_
     }
 }
+#endregion
 
+#region Sensitivity label resolution
 # Function to get sensitivity label display name from GUID
 Function Get-SensitivityLabelDisplayName {
     param (
@@ -684,7 +828,9 @@ Function Get-SensitivityLabelDisplayName {
         return $LabelId
     }
 }
+#endregion
 
+#region Main execution and cleanup
 # Main script execution
 try {
     # Create log file
@@ -747,6 +893,7 @@ try {
                     $exportObject = [PSCustomObject]@{
                         "WebURL"                          = $siteInfo."WebURL"
                         "Copilot Name"                    = $siteInfo."Copilot Name"
+                        "Library Name"                    = $agent.LibraryName
                         "CreatedDate"                     = $siteInfo."CreatedDate"
                         "LastAccessedDate"                = $siteInfo."LastAccessedDate"
                         "Owner"                           = $siteInfo."Owner"
@@ -795,3 +942,4 @@ finally {
         # Ignore any disconnection errors
     }
 }
+#endregion
