@@ -1,20 +1,26 @@
 <#
 .SYNOPSIS
-    Finds a SharePoint Online document by GUID or name across the tenant.
+    Finds a SharePoint Online document by name, GUID, or URL across the tenant.
 
 .DESCRIPTION
     Presents a menu to search by:
       1. Document Name  - tenant-wide Graph API keyword search
       2. Document GUID  - exact match via Graph API
+      3. Document URL   - exact SharePoint URL match via Graph API
 
     Uses app-only certificate authentication directly against Microsoft Graph.
     No PnP PowerShell module required.
 
-    Results are printed to the console.
+    Results are printed to the console and include the document name,
+    SharePoint URL, owner, item type, list item/drive item UniqueId, and DriveId.
+
+    URL searches extract the document filename for Graph Search and filter
+    the matches by a normalized, exact URL.
 
 .NOTES
     Authors: Mike Lee
     Updated: 5/6/2026
+    Updated: 11/25/2026 - added search by document URL
 
     Requires an Entra app registration with:
       - Graph: Sites.Read.All, Files.Read.All
@@ -59,7 +65,7 @@ Function Write-LogEntry {
         [string] $Level = "INFO"
     )
     if ($Level -eq "ERROR" -or $Level -eq "INFO" -or ($Level -eq "DEBUG" -and $debugLogging)) {
-        if ($null -ne $LogName) {
+        if (-not [string]::IsNullOrWhiteSpace($LogName)) {
             $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             Add-Content -Path $LogName -Value "[$timestamp] [$Level] $LogEntryText"
         }
@@ -316,6 +322,19 @@ Function Search-DocumentViaGraphAPI {
                     }
                     else { "" }
 
+                    $driveId = if ($r.PSObject.Properties['parentReference'] -and $r.parentReference -and
+                        $r.parentReference.PSObject.Properties['driveId'] -and $r.parentReference.driveId) {
+                        $r.parentReference.driveId
+                    }
+                    elseif ($r.PSObject.Properties['sharepointIds'] -and $r.sharepointIds -and
+                        $r.sharepointIds.PSObject.Properties['driveId'] -and $r.sharepointIds.driveId) {
+                        $r.sharepointIds.driveId
+                    }
+                    elseif ($r.PSObject.Properties['driveId'] -and $r.driveId) {
+                        $r.driveId
+                    }
+                    else { "" }
+
                     $results.Add([PSCustomObject]@{
                             Source   = "Graph API ($entityType)"
                             ItemType = $entityType
@@ -323,6 +342,7 @@ Function Search-DocumentViaGraphAPI {
                             Owner    = $owner
                             Name     = $itemName
                             UniqueId = $uniqueId
+                            DriveId  = $driveId
                         })
                 }
             }
@@ -334,7 +354,7 @@ Function Search-DocumentViaGraphAPI {
     }
 
     # Deduplicate by URL — Graph returns the same file as both driveItem and listItem.
-    # Merge UniqueId from the second entry if the first one lacks it.
+    # Merge fields from the second entry if the first one lacks them.
     $seen = @{}
     $deduped = [System.Collections.Generic.List[PSObject]]::new()
     foreach ($entry in $results) {
@@ -342,9 +362,16 @@ Function Search-DocumentViaGraphAPI {
             $seen[$entry.Url] = $deduped.Count
             $deduped.Add($entry)
         }
-        elseif ([string]::IsNullOrWhiteSpace($deduped[$seen[$entry.Url]].UniqueId) -and
-            -not [string]::IsNullOrWhiteSpace($entry.UniqueId)) {
-            $deduped[$seen[$entry.Url]].UniqueId = $entry.UniqueId
+        else {
+            $existing = $deduped[$seen[$entry.Url]]
+            if ([string]::IsNullOrWhiteSpace($existing.UniqueId) -and
+                -not [string]::IsNullOrWhiteSpace($entry.UniqueId)) {
+                $existing.UniqueId = $entry.UniqueId
+            }
+            if ([string]::IsNullOrWhiteSpace($existing.DriveId) -and
+                -not [string]::IsNullOrWhiteSpace($entry.DriveId)) {
+                $existing.DriveId = $entry.DriveId
+            }
         }
     }
     return $deduped
@@ -419,6 +446,19 @@ Function Search-DocumentByName {
                     }
                     else { "" }
 
+                    $driveId = if ($r.PSObject.Properties['parentReference'] -and $r.parentReference -and
+                        $r.parentReference.PSObject.Properties['driveId'] -and $r.parentReference.driveId) {
+                        $r.parentReference.driveId
+                    }
+                    elseif ($r.PSObject.Properties['sharepointIds'] -and $r.sharepointIds -and
+                        $r.sharepointIds.PSObject.Properties['driveId'] -and $r.sharepointIds.driveId) {
+                        $r.sharepointIds.driveId
+                    }
+                    elseif ($r.PSObject.Properties['driveId'] -and $r.driveId) {
+                        $r.driveId
+                    }
+                    else { "" }
+
                     $results.Add([PSCustomObject]@{
                             Source   = "Graph API ($entityType)"
                             ItemType = $entityType
@@ -426,6 +466,7 @@ Function Search-DocumentByName {
                             Owner    = $owner
                             Name     = $itemName
                             UniqueId = $uniqueId
+                            DriveId  = $driveId
                         })
                 }
             }
@@ -437,7 +478,7 @@ Function Search-DocumentByName {
     }
 
     # Deduplicate by URL — Graph returns the same file as both driveItem and listItem.
-    # Merge UniqueId from the second entry if the first one lacks it.
+    # Merge fields from the second entry if the first one lacks them.
     $seen = @{}
     $deduped = [System.Collections.Generic.List[PSObject]]::new()
     foreach ($entry in $results) {
@@ -445,12 +486,69 @@ Function Search-DocumentByName {
             $seen[$entry.Url] = $deduped.Count
             $deduped.Add($entry)
         }
-        elseif ([string]::IsNullOrWhiteSpace($deduped[$seen[$entry.Url]].UniqueId) -and
-            -not [string]::IsNullOrWhiteSpace($entry.UniqueId)) {
-            $deduped[$seen[$entry.Url]].UniqueId = $entry.UniqueId
+        else {
+            $existing = $deduped[$seen[$entry.Url]]
+            if ([string]::IsNullOrWhiteSpace($existing.UniqueId) -and
+                -not [string]::IsNullOrWhiteSpace($entry.UniqueId)) {
+                $existing.UniqueId = $entry.UniqueId
+            }
+            if ([string]::IsNullOrWhiteSpace($existing.DriveId) -and
+                -not [string]::IsNullOrWhiteSpace($entry.DriveId)) {
+                $existing.DriveId = $entry.DriveId
+            }
         }
     }
     return $deduped
+}
+
+# ----------------------------------------------
+# Search for a document by exact SharePoint URL
+# ----------------------------------------------
+Function Search-DocumentByUrl {
+    param(
+        [Parameter(Mandatory)] [string] $DocumentUrl,
+        [Parameter(Mandatory)] [string] $SearchRegion
+    )
+
+    try {
+        $enteredUri = [System.Uri]::new($DocumentUrl)
+        $leafName = [System.Uri]::UnescapeDataString($enteredUri.Segments[-1]).Trim()
+        if ([string]::IsNullOrWhiteSpace($leafName)) {
+            return [System.Collections.Generic.List[PSObject]]::new()
+        }
+
+        $normalizeUrl = {
+            param([string] $Url)
+            try {
+                $uri = [System.Uri]::new($Url)
+                $unescapedPath = [System.Uri]::UnescapeDataString($uri.AbsolutePath)
+                return ("{0}://{1}{2}" -f $uri.Scheme.ToLowerInvariant(), $uri.DnsSafeHost.ToLowerInvariant(), $unescapedPath).TrimEnd('/').ToLowerInvariant()
+            }
+            catch {
+                return $Url.Trim().TrimEnd('/').ToLowerInvariant()
+            }
+        }
+
+        $normalizedEnteredUrl = & $normalizeUrl $enteredUri.AbsoluteUri
+        $matches = Search-DocumentByName -DocumentName $leafName -SearchRegion $SearchRegion
+        $exactMatches = [System.Collections.Generic.List[PSObject]]::new()
+
+        foreach ($match in $matches) {
+            if (-not [string]::IsNullOrWhiteSpace($match.Url)) {
+                $normalizedMatchUrl = & $normalizeUrl $match.Url
+                if ($normalizedMatchUrl -eq $normalizedEnteredUrl) {
+                    $exactMatches.Add($match)
+                }
+            }
+        }
+
+        return $exactMatches
+    }
+    catch {
+        Write-Host "  ERROR during Graph URL search: $_" -ForegroundColor Red
+        Write-ErrorLog -LogName $log -LogEntryText "Graph URL search error for '$DocumentUrl': $_"
+        return [System.Collections.Generic.List[PSObject]]::new()
+    }
 }
 #endregion Search Functions
 
@@ -468,6 +566,9 @@ Function Show-Results {
         Write-Host "  ItemType : $($item.ItemType)" -ForegroundColor White
         if (-not [string]::IsNullOrWhiteSpace($item.UniqueId)) {
             Write-Host "  UniqueId : $($item.UniqueId)" -ForegroundColor Yellow
+        }
+        if (-not [string]::IsNullOrWhiteSpace($item.DriveId)) {
+            Write-Host "  DriveId  : $($item.DriveId)" -ForegroundColor Yellow
         }
         Write-Host ""
     }
@@ -487,11 +588,12 @@ Write-Host ""
 Write-Host "How do you want to search?" -ForegroundColor White
 Write-Host "  1. By Document Name" -ForegroundColor White
 Write-Host "  2. By Document GUID" -ForegroundColor White
+Write-Host "  3. By Document URL" -ForegroundColor White
 Write-Host ""
 
 do {
-    $searchChoice = (Read-Host "Enter choice (1 or 2)").Trim()
-} while ($searchChoice -notin @('1', '2'))
+    $searchChoice = (Read-Host "Enter choice (1, 2, or 3)").Trim()
+} while ($searchChoice -notin @('1', '2', '3'))
 
 # --- Collect search term ---
 if ($searchChoice -eq '1') {
@@ -500,7 +602,7 @@ if ($searchChoice -eq '1') {
     } while ([string]::IsNullOrWhiteSpace($DocumentName))
     Write-InfoLog -LogName $log -LogEntryText "Starting document search by name: '$DocumentName'"
 }
-else {
+elseif ($searchChoice -eq '2') {
     do {
         $DocumentId = (Read-Host "Enter the document GUID to search for").Trim()
         $guidValid = $DocumentId -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
@@ -509,6 +611,23 @@ else {
         }
     } while (-not $guidValid)
     Write-InfoLog -LogName $log -LogEntryText "Starting document search by GUID: $DocumentId"
+}
+else {
+    do {
+        $DocumentUrl = (Read-Host "Enter the full document URL").Trim()
+        $urlValid = $false
+        try {
+            $documentUri = [System.Uri]::new($DocumentUrl)
+            $urlValid = $documentUri.Scheme -in @('http', 'https')
+        }
+        catch {
+            $urlValid = $false
+        }
+        if (-not $urlValid) {
+            Write-Host "  Invalid URL format. Enter a full HTTP or HTTPS SharePoint document URL." -ForegroundColor Yellow
+        }
+    } while (-not $urlValid)
+    Write-InfoLog -LogName $log -LogEntryText "Starting document search by URL: '$DocumentUrl'"
 }
 
 # --- Acquire Token ---
@@ -552,6 +671,30 @@ if ($searchChoice -eq '1') {
         Write-Host "NOT FOUND via Graph API." -ForegroundColor Yellow
         Write-Host "The document may not be indexed or the name may not match exactly." -ForegroundColor Yellow
         Write-InfoLog -LogName $log -LogEntryText "Graph API returned no results for name '$DocumentName'"
+    }
+}
+# ============================================================
+# Branch: URL search
+# ============================================================
+elseif ($searchChoice -eq '3') {
+    Write-Host ""
+    Write-Host "Searching via Microsoft Graph API (tenant-wide)..." -ForegroundColor Cyan
+    Write-Host "  Document URL : $DocumentUrl" -ForegroundColor White
+    Write-Host "  Search Region : $searchRegion" -ForegroundColor White
+    Write-Host ""
+
+    $graphResults = Search-DocumentByUrl -DocumentUrl $DocumentUrl -SearchRegion $searchRegion
+
+    if ($graphResults -and $graphResults.Count -gt 0) {
+        Write-Host "FOUND - $($graphResults.Count) exact result(s) via Graph API:" -ForegroundColor Green
+        Write-Host ""
+        Show-Results -ResultList $graphResults
+        Write-InfoLog -LogName $log -LogEntryText "Graph API found $($graphResults.Count) result(s) for URL '$DocumentUrl'"
+    }
+    else {
+        Write-Host "NOT FOUND via Graph API." -ForegroundColor Yellow
+        Write-Host "The URL may not match an indexed SharePoint document, or the document may be deleted." -ForegroundColor Yellow
+        Write-InfoLog -LogName $log -LogEntryText "Graph API returned no exact results for URL '$DocumentUrl'"
     }
 }
 # ============================================================
